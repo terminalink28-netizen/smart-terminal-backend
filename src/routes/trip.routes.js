@@ -1,33 +1,32 @@
 import express from 'express';
 import {
-  getMyTrips,
-  createTrip,
-  updateTripStatus,
-  handleQrScan,
-  getDispatchResources,
-  selfStartTrip,
   getLiveTrips,
+  getDispatchResources,
+  createTrip,
+  getMyTrips,
+  selfStartTrip,
+  updateTripStatus,
+  handleQrScan
 } from '../controllers/trip.controller.js';
-
-import { requireAuth, requireRoles } from '../middleware/auth.js'; 
+import { requireAuth, requireRoles } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
 
-// ─── Public routes ────────────────────────────────────────────────────────────
-
-// Unlocked so the Public Tracking page can fetch live fleet data without a login
+// ─── Public Routes ───
 router.get('/live', getLiveTrips);
 
-// ─── Driver routes ────────────────────────────────────────────────────────────
+// ─── Dispatcher & Admin Routes ───
+// These fetch available vans/drivers and allow manual dispatching
+router.get('/dispatch-resources', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), getDispatchResources);
+router.post('/dispatch', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), createTrip);
 
+// ─── Driver Routes ───
+// These allow drivers to fetch their assignments and start their own trips
 router.get('/my-trips', requireAuth, requireRoles(['DRIVER']), getMyTrips);
 router.post('/self-start', requireAuth, requireRoles(['DRIVER']), selfStartTrip);
 
-// ─── Dispatcher & Admin routes ────────────────────────────────────────────────
-
-router.get('/resources', requireAuth, requireRoles(['DISPATCHER', 'ADMIN']), getDispatchResources);
-router.post('/', requireAuth, requireRoles(['DISPATCHER', 'ADMIN']), createTrip);
-router.patch('/:id/status', requireAuth, requireRoles(['DISPATCHER', 'DRIVER', 'ADMIN']), updateTripStatus);
-router.post('/qr-scan', requireAuth, requireRoles(['DISPATCHER', 'ADMIN']), handleQrScan);
+// ─── Shared Shared Status Updates ───
+router.patch('/:id/status', requireAuth, updateTripStatus);
+router.post('/qr-scan', requireAuth, handleQrScan);
 
 export default router;
