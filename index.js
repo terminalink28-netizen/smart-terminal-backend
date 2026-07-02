@@ -32,12 +32,21 @@ initializeSockets(httpServer);
 app.use(express.json());
 app.use(cookieParser());
 
+// --- CORS FIX ---
+// This VIP list tells the backend which frontends are allowed to request data.
+const allowedOrigins = [
+  'http://localhost:3000', 
+  'http://localhost:5173', 
+  'https://smart-terminal-frontend.vercel.app' // Your live Vercel URL
+];
+
 app.use(
   cors({
-    origin: 'http://localhost:3000',
+    origin: allowedOrigins,
     credentials: true,
   })
 );
+// ----------------
 
 app.use('/api/auth', authRoutes);
 app.use('/api/trips', tripRoutes);
@@ -68,7 +77,7 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 httpServer.listen(PORT, () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
+  console.log(`🚀 Backend running on port ${PORT}`);
   console.log('📡 WebSocket server ready');
   console.log('🧹 Live tracking cache cleared');
 });
