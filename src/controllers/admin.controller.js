@@ -43,7 +43,6 @@ export const createUser = async (req, res) => {
   try {
     const { name, email, role, driverId, password } = req.body;
     
-    // Hash the password or PIN
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const newUser = await prisma.user.create({
@@ -99,17 +98,45 @@ export const deleteUser = async (req, res) => {
   }
 };
 
-// ─── Fleet Management ───
+// ─── Fleet & Driver Combined Management ───
 export const createVan = async (req, res) => {
   try {
-    const { plateNumber, capacity, status } = req.body;
+    const { plateNumber, capacity, status, driverName, driverPin } = req.body;
+    
+    // If the frontend sent driver details, create both the Van and the Driver atomically
+    if (driverName && driverPin) {
+      const hashedPassword = await bcrypt.hash(driverPin, 10);
+      
+      const result = await prisma.$transaction(async (tx) => {
+        const newVan = await tx.van.create({
+          data: { plateNumber, capacity, status }
+        });
+        
+        const newDriver = await tx.user.create({
+          data: {
+            name: driverName,
+            role: 'DRIVER',
+            driverId: plateNumber, // The driver's login ID becomes the Van Plate Number
+            pinHash: hashedPassword,
+            passwordHash: hashedPassword, // Fallback for robust login check
+            isActive: true
+          }
+        });
+        
+        return newVan;
+      });
+      return res.status(201).json(result);
+    } 
+    
+    // Fallback if just a van is created (e.g. via API)
     const newVan = await prisma.van.create({
       data: { plateNumber, capacity, status }
     });
     return res.status(201).json(newVan);
+    
   } catch (error) {
     console.error('[Create Van Error]', error);
-    return res.status(500).json({ error: 'Failed to create van. Plate number may already exist.' });
+    return res.status(500).json({ error: 'Failed to register fleet unit. The Plate Number may already exist in the database.' });
   }
 };
 
@@ -142,8 +169,6 @@ export const deleteVan = async (req, res) => {
 // ─── Audit Trail ───
 export const getAuditLogs = async (req, res) => {
   try {
-    // If you don't have an Audit table yet, this safely returns an empty array to prevent frontend crashes
-    // If you DO have an audit table, replace this with: await prisma.auditLog.findMany(...)
     return res.status(200).json({ logs: [] });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load audit logs.' });
