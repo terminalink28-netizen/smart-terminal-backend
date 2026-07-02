@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --- ENUMS ---
+enum Role {
+  ADMIN
+  DISPATCHER
+  DRIVER
+}
+
+enum VanStatus {
+  IDLE
+  ON_TRIP
+  MAINTENANCE
+}
+
+enum TripStatus {
+  SCHEDULED
+  BOARDING
+  DEPARTING
+  DEPARTED
+  ARRIVING
+  COMPLETED
+  DELAYED
+  CANCELLED
+}
+
+// --- MODELS ---
+model User {
+  id            String   @id @default(uuid())
+  role          Role
+  name          String
+  email         String?  @unique // Nullable for drivers
+  driverId      String?  @unique // Nullable for admin/dispatchers
+  passwordHash  String?  // For email login
+  pinHash       String?  // For driver login
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  tripsAsDriver     Trip[]              @relation("TripDriver")
+  statusUpdates     TripStatusHistory[] @relation("RecordedBy")
+  qrScans           QrScanLog[]         @relation("ScannedBy")
+}
+
+model Van {
+  id            String    @id @default(uuid())
+  plateNumber   String    @unique
+  capacity      Int
+  status        VanStatus @default(IDLE)
+  
+  // Relations
+  trips         Trip[]
+  qrScans       QrScanLog[]
+}
+
+model Route {
+  id            String @id @default(uuid())
+  name          String
+  origin        String
+  destination   String
+  waypoints     Json?  // Store path coordinates as JSON array
+  
+  // Relations
+  trips         Trip[]
+}
+
+model Trip {
+  id               String     @id @default(uuid())
+  routeId          String
+  vanId            String
+  driverId         String
+  status           TripStatus @default(SCHEDULED)
+  scheduledTime    DateTime
+  actualDeparture  DateTime?
+  actualArrival    DateTime?
+  
+  // Relations
+  route            Route               @relation(fields: [routeId], references: [id])
+  van              Van                 @relation(fields: [vanId], references: [id])
+  driver           User                @relation("TripDriver", fields: [driverId], references: [id])
+  statusHistory    TripStatusHistory[]
+  gpsTelemetry     GpsTelemetry[]
+  qrScans          QrScanLog[]
+}
+
+model TripStatusHistory {
+  id               String     @id @default(uuid())
+  tripId           String
+  status           TripStatus
+  recordedById     String?
+  timestamp        DateTime   @default(now())
+
+  // Relations
+  trip             Trip       @relation(fields: [tripId], references: [id])
+  recordedBy       User?      @relation("RecordedBy", fields: [recordedById], references: [id])
+}
+
+model GpsTelemetry {
+  id        String   @id @default(uuid())
+  tripId    String
+  lat       Float
+  lng       Float
+  speed     Float?
+  timestamp DateTime @default(now())
+
+  // Relations
+  trip      Trip     @relation(fields: [tripId], references: [id])
+}
+
+model QrScanLog {
+  id          String   @id @default(uuid())
+  tripId      String
+  vanId       String
+  scannedById String
+  action      String   // "ARRIVAL" or "DEPARTURE"
+  timestamp   DateTime @default(now())
+
+  // Relations
+  trip        Trip     @relation(fields: [tripId], references: [id])
+  van         Van      @relation(fields: [vanId], references: [id])
+  scannedBy   User     @relation("ScannedBy", fields: [scannedById], references: [id])
+}

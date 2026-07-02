@@ -1,0 +1,2 @@
+"UPDATE ""Van"" SET ""plateNumber"" = 'VAN-001', status = 'IDLE' WHERE ""plateNumber"" = 'VIR-001';" | Out-File -Encoding utf8 fix.sql
+"UPDATE ""Van"" SET ""plateNumber"" = 'VAN-002', status = 'IDLE' WHERE ""plateNumber"" = 'VIR-002';" | Out-File -Encoding utf8 -Append fix.sql
