@@ -14,13 +14,21 @@ export const clearLiveLocations = () => {
   console.log('🧹 Cleared all live GPS tracking data');
 };
 
+// --- CORS FIX ---
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'https://smart-terminal-frontend.vercel.app' // Your live Vercel URL
+];
+// ----------------
+
 export const initializeSockets = (httpServer) => {
   // Always start with a clean cache
   clearLiveLocations();
 
   const io = new Server(httpServer, {
     cors: {
-      origin: 'http://localhost:3000',
+      origin: allowedOrigins, // Updated to use the VIP list
       methods: ['GET', 'POST'],
       credentials: true,
     },
