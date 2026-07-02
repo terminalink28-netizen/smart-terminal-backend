@@ -82,12 +82,14 @@ export const login = async (req, res) => {
 
     const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '12h' });
 
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 12 * 60 * 60 * 1000 
-    });
+    // Inside src/controllers/auth.controller.js (or similar)
+
+res.cookie('token', token, {
+  httpOnly: true,
+  secure: true,       // CRUCIAL: Forces HTTPS, required for cross-domain
+  sameSite: 'none',   // CRUCIAL: Tells the browser it's okay to send from Vercel to Render
+  maxAge: 24 * 60 * 60 * 1000 // 1 day
+});
 
     return res.status(200).json({ message: 'Login successful', user: tokenPayload });
 
