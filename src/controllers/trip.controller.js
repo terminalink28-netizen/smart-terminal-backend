@@ -72,13 +72,6 @@ export const updateTripStatus = async (req, res) => {
     const { newStatus } = req.body;
     const userId        = req.user.id;
 
-    if (
-  newStatus === 'COMPLETED' ||
-  newStatus === 'CANCELLED'
-) {
-  liveLocations.delete(updatedTrip.id);
-}
-
     const updatedTrip = await prisma.$transaction(async (tx) => {
       const trip = await tx.trip.findUnique({ where: { id } });
       if (!trip) throw new HttpError(404, 'Trip not found.');
@@ -101,7 +94,6 @@ export const updateTripStatus = async (req, res) => {
         data: { tripId: id, status: newStatus, recordedById: userId },
       });
 
-      // If the trip is over, release the van so it can be dispatched again
       if (newStatus === 'COMPLETED' || newStatus === 'CANCELLED') {
         await tx.van.update({
           where: { id: trip.vanId },
