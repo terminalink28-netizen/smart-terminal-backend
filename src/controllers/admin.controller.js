@@ -107,7 +107,7 @@ export const createVan = async (req, res) => {
     if (driverName && driverPin) {
       const hashedPassword = await bcrypt.hash(driverPin, 10);
       
-      const result = await prisma.$transaction(async (tx) => {
+      const { van, driver } = await prisma.$transaction(async (tx) => {
         const newVan = await tx.van.create({
           data: { plateNumber, capacity, status }
         });
@@ -122,10 +122,22 @@ export const createVan = async (req, res) => {
             isActive: true
           }
         });
-        
-        return newVan;
+
+        return { van: newVan, driver: newDriver };
       });
-      return res.status(201).json(result);
+
+      // Return both records so the frontend can show the admin the driver's
+      // login ID right away. Never send pinHash/passwordHash back.
+      return res.status(201).json({
+        ...van,
+        driver: {
+          id: driver.id,
+          name: driver.name,
+          driverId: driver.driverId,
+          role: driver.role,
+          isActive: driver.isActive,
+        },
+      });
     } 
     
     // Fallback if just a van is created (e.g. via API)

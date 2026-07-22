@@ -50,14 +50,18 @@ export const login = async (req, res) => {
       }
     } else {
       console.log(`Flow: Driver (ID)`);
-      // Bulletproof check for driver ID queries
+      // The User model only has a `driverId` column — `driver_id_string`
+      // isn't part of the schema and Prisma rejects unknown fields outright.
       user = await prisma.user.findFirst({
-        where: { OR: [{ driverId: identifier }, { driver_id_string: identifier }] }
+        where: { driverId: identifier }
       });
-      
+
       const dbPinHash = user?.pinHash || user?.pin_hash;
       if (user && dbPinHash) {
         isValidSecret = await bcrypt.compare(secret, dbPinHash);
+        console.log(`PIN Match:`, isValidSecret);
+      } else {
+        console.log(`Error: Missing PIN hash in database object.`);
       }
     }
 
@@ -77,7 +81,7 @@ export const login = async (req, res) => {
       id: user.id,
       role: user.role,
       name: user.name,
-      driverId: user.driverId || user.driver_id_string
+      driverId: user.driverId
     };
 
     const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '12h' });
@@ -86,12 +90,12 @@ export const login = async (req, res) => {
 
 res.cookie('token', token, {
   httpOnly: true,
-  secure: true,
-  sameSite: 'none',
-  maxAge: 24 * 60 * 60 * 1000
+  secure: true,       // CRUCIAL: Forces HTTPS, required for cross-domain
+  sameSite: 'none',   // CRUCIAL: Tells the browser it's okay to send from Vercel to Render
+  maxAge: 24 * 60 * 60 * 1000 // 1 day
 });
 
-return res.status(200).json({ message: 'Login successful', user: tokenPayload, token });
+    return res.status(200).json({ message: 'Login successful', user: tokenPayload, token });
 
   } catch (error) {
     console.error('[Auth Error]', error);
