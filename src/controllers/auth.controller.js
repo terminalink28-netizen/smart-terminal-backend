@@ -104,6 +104,10 @@ res.cookie('token', token, {
 };
 
 export const logout = (req, res) => {
-  res.clearCookie('token');
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+  });
   return res.status(200).json({ message: 'Logged out successfully' });
 };
