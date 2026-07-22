@@ -1,8 +1,11 @@
 import jwt from 'jsonwebtoken';
 
 export const requireAuth = (req, res, next) => {
-  // FIX 1: Optional chaining prevents fatal server crashes
-  const token = req.cookies?.token || req.headers.authorization?.split(' ')[1];
+  // Prefer the Authorization header — it's the primary auth path now.
+  // Only fall back to the cookie if no header was sent at all, so a
+  // stale/invalid leftover cookie can never silently override a valid
+  // Bearer token.
+  const token = req.headers.authorization?.split(' ')[1] || req.cookies?.token;
 
   if (!token) {
     return res.status(401).json({ error: 'Authentication required.' });
