@@ -91,6 +91,74 @@ function handleError(res, error, context, fallbackMessage = 'Internal server err
   return res.status(500).json({ error: fallbackMessage });
 }
 
+// ─── 0. Dispatcher: vans currently AT the terminal ────────────────────────────
+//
+// "At the terminal" means: IDLE (parked, no active trip — just completed one
+// or never started one) OR BOARDING (assigned a route, still loading
+// passengers on-site). The moment a van's trip moves to DEPARTING or beyond,
+// it has physically left, so it drops out of this list entirely — it shows
+// up instead in the live-tracking / map views that already exist.
+//
+// A van's "home" driver is resolved via User.driverId === Van.plateNumber
+// (see selfStartTrip) rather than through the trip, since an IDLE van has
+// no active trip to read a driver off of.
+
+export const getTerminalVans = async (req, res) => {
+  try {
+    const [idleVans, boardingTrips] = await Promise.all([
+      prisma.van.findMany({
+        where: { status: 'IDLE' },
+        orderBy: { plateNumber: 'asc' },
+      }),
+      prisma.trip.findMany({
+        where: { status: 'BOARDING' },
+        include: TRIP_INCLUDE,
+        orderBy: { id: 'desc' },
+      }),
+    ]);
+
+    const idlePlateNumbers = idleVans.map((v) => v.plateNumber);
+    const idleDrivers = idlePlateNumbers.length
+      ? await prisma.user.findMany({
+          where: { role: 'DRIVER', driverId: { in: idlePlateNumbers } },
+          select: { id: true, name: true, driverId: true },
+        })
+      : [];
+    const driverByPlate = new Map(idleDrivers.map((d) => [d.driverId, d]));
+
+    const idleEntries = idleVans.map((van) => ({
+      vanId: van.id,
+      plateNumber: van.plateNumber,
+      capacity: van.capacity,
+      terminalStatus: 'IDLE',
+      driver: driverByPlate.get(van.plateNumber) ?? null,
+      trip: null,
+    }));
+
+    const boardingEntries = boardingTrips.map((trip) => ({
+      vanId: trip.van.id,
+      plateNumber: trip.van.plateNumber,
+      capacity: trip.van.capacity,
+      terminalStatus: 'BOARDING',
+      driver: trip.driver,
+      trip: {
+        id: trip.id,
+        routeName: trip.route?.name ?? null,
+        origin: trip.route?.origin ?? null,
+        destination: trip.route?.destination ?? null,
+        scheduledTime: trip.scheduledTime,
+      },
+    }));
+
+    // Boarding vans first — they're mid-process and more actionable
+    // for a dispatcher glancing at the list.
+    return res.status(200).json([...boardingEntries, ...idleEntries]);
+  } catch (error) {
+    return handleError(res, error, 'getTerminalVans', 'Failed to load vans at the terminal.');
+  }
+};
+
+
 // ─── 1. Update trip status ────────────────────────────────────────────────────
 
 export const updateTripStatus = async (req, res) => {
