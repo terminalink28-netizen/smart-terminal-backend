@@ -1,7 +1,7 @@
 import { PrismaClient, Prisma } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { verifyVanQrToken } from '../utils/qr.util.js';
+import { verifyVanQrToken, signVanQrToken } from '../utils/qr.util.js';
 
 const pool    = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -50,6 +50,21 @@ class HttpError extends Error {
     super(message);
     this.statusCode = statusCode;
   }
+}
+
+/**
+ * Attaches this trip's van QR token to driver-facing trip responses, so the
+ * frontend can render a scannable code (e.g. for trip completion) without a
+ * separate round-trip. The token is a pure function of the van's id — no
+ * extra DB lookup, and safe to regenerate on every response.
+ *
+ * Deliberately NOT applied to public/dispatcher-facing endpoints like
+ * getLiveTrips — that route has no auth at all, and leaking this token
+ * there would let anyone advance a trip's status without scanning anything.
+ */
+function withVanQrToken(trip) {
+  if (!trip?.van?.id) return trip;
+  return { ...trip, van: { ...trip.van, qrToken: signVanQrToken(trip.van.id) } };
 }
 
 /**
@@ -123,7 +138,7 @@ export const updateTripStatus = async (req, res) => {
       trip:   updatedTrip,
     });
 
-    return res.status(200).json({ message: 'Status updated', trip: updatedTrip });
+    return res.status(200).json({ message: 'Status updated', trip: withVanQrToken(updatedTrip) });
   } catch (error) {
     return handleError(res, error, 'updateTripStatus', 'Failed to update trip status.');
   }
@@ -237,7 +252,7 @@ export const getMyTrips = async (req, res) => {
       },
     });
 
-    return res.status(200).json(trips);
+    return res.status(200).json(trips.map(withVanQrToken));
   } catch (error) {
     return handleError(res, error, 'getMyTrips', 'Failed to fetch assigned trips.');
   }
@@ -341,7 +356,7 @@ export const selfStartTrip = async (req, res) => {
       trip:   newTrip,
     });
 
-    return res.status(201).json(newTrip);
+    return res.status(201).json(withVanQrToken(newTrip));
   } catch (error) {
     return handleError(res, error, 'selfStartTrip', 'An unexpected error occurred while starting your trip. Please try again.');
   }
