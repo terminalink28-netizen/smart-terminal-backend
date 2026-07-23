@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { signVanQrToken } from '../utils/qr.util.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -24,14 +25,21 @@ export const getSystemStats = async (req, res) => {
     });
 
     const fleet = await prisma.van.findMany({
-      orderBy: { plateNumber: 'asc' }
-    });
+  orderBy: { plateNumber: 'asc' }
+});
 
-    return res.status(200).json({
-      stats: { totalUsers, totalVans, totalTrips, activeTrips },
-      staff,
-      fleet
-    });
+// Attach each van's permanent scan token so the admin table can show
+// a "View QR" action for any van, not just newly-created ones.
+const fleetWithQr = fleet.map((van) => ({
+  ...van,
+  qrToken: signVanQrToken(van.id),
+}));
+
+return res.status(200).json({
+  stats: { totalUsers, totalVans, totalTrips, activeTrips },
+  staff,
+  fleet: fleetWithQr, // <-- changed from `fleet`
+});
   } catch (error) {
     console.error('[Admin Stats Error]', error);
     return res.status(500).json({ error: 'Failed to fetch system stats.' });
@@ -103,7 +111,6 @@ export const createVan = async (req, res) => {
   try {
     const { plateNumber, capacity, status, driverName, driverPin } = req.body;
     
-    // If the frontend sent driver details, create both the Van and the Driver atomically
     if (driverName && driverPin) {
       const hashedPassword = await bcrypt.hash(driverPin, 10);
       
@@ -116,9 +123,9 @@ export const createVan = async (req, res) => {
           data: {
             name: driverName,
             role: 'DRIVER',
-            driverId: plateNumber, // The driver's login ID becomes the Van Plate Number
+            driverId: plateNumber,
             pinHash: hashedPassword,
-            passwordHash: hashedPassword, // Fallback for robust login check
+            passwordHash: hashedPassword,
             isActive: true
           }
         });
@@ -126,10 +133,9 @@ export const createVan = async (req, res) => {
         return { van: newVan, driver: newDriver };
       });
 
-      // Return both records so the frontend can show the admin the driver's
-      // login ID right away. Never send pinHash/passwordHash back.
       return res.status(201).json({
         ...van,
+        qrToken: signVanQrToken(van.id), // <-- new: permanent scan token for this van
         driver: {
           id: driver.id,
           name: driver.name,
@@ -140,11 +146,13 @@ export const createVan = async (req, res) => {
       });
     } 
     
-    // Fallback if just a van is created (e.g. via API)
     const newVan = await prisma.van.create({
       data: { plateNumber, capacity, status }
     });
-    return res.status(201).json(newVan);
+    return res.status(201).json({
+      ...newVan,
+      qrToken: signVanQrToken(newVan.id), // <-- new
+    });
     
   } catch (error) {
     console.error('[Create Van Error]', error);

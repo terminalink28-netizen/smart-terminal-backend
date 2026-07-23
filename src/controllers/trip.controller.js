@@ -1,6 +1,7 @@
 import { PrismaClient, Prisma } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { verifyVanQrToken } from '../utils/qr.util.js';
 
 const pool    = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -28,6 +29,17 @@ const TRIP_INCLUDE = {
   driver: { select: { id: true, name: true } },
   route:  true,
   van:    true,
+};
+
+// Maps a van's CURRENT trip status to the action a QR scan performs.
+// This is what makes a single printed sticker on the van work correctly
+// at every checkpoint — the backend derives the right transition from
+// whatever state the trip is actually in; the scanner just scans.
+const SCAN_TRANSITIONS = {
+  DEPARTING: { nextStatus: 'DEPARTED',  action: 'DEPARTURE',  setField: 'actualDeparture' },
+  DEPARTED:  { nextStatus: 'ARRIVING',  action: 'ARRIVAL',    setField: 'actualArrival'   },
+  DELAYED:   { nextStatus: 'ARRIVING',  action: 'ARRIVAL',    setField: 'actualArrival'   },
+  ARRIVING:  { nextStatus: 'COMPLETED', action: 'COMPLETION', setField: null              },
 };
 
 // ─── Small helpers ─────────────────────────────────────────────────────────────
@@ -94,6 +106,7 @@ export const updateTripStatus = async (req, res) => {
         data: { tripId: id, status: newStatus, recordedById: userId },
       });
 
+      // If the trip is over, release the van so it can be dispatched again
       if (newStatus === 'COMPLETED' || newStatus === 'CANCELLED') {
         await tx.van.update({
           where: { id: trip.vanId },
@@ -117,71 +130,91 @@ export const updateTripStatus = async (req, res) => {
 };
 
 // ─── 2. QR scan handler ───────────────────────────────────────────────────────
+//
+// Scans a signed, permanent van QR token (issued once at van creation —
+// see admin.controller.js's createVan / getVanQrToken). No tripId or
+// action is ever trusted from the client: the token only identifies the
+// van, and the backend looks up that van's CURRENT active trip to decide
+// what a scan should do. This means one printed sticker on the van works
+// correctly at every checkpoint of every future trip, and a scan can
+// never be used to force an arbitrary status transition.
 
 export const handleQrScan = async (req, res) => {
   try {
-    const { tripId, vanId, action } = req.body;
+    const { qrToken } = req.body;
     const userId = req.user.id;
 
-    if (!tripId || !vanId || !action) {
-      return res.status(400).json({ error: 'tripId, vanId, and action are all required.' });
+    if (!qrToken) {
+      return res.status(400).json({ error: 'qrToken is required.' });
     }
 
-    if (action !== 'DEPARTURE' && action !== 'ARRIVAL') {
-      return res.status(400).json({ error: 'Unknown QR action.' });
+    const vanId = verifyVanQrToken(qrToken);
+    if (!vanId) {
+      return res.status(400).json({ error: 'Invalid or unrecognized QR code.' });
     }
 
-    const updatedTrip = await prisma.$transaction(async (tx) => {
-      const trip = await tx.trip.findUnique({ where: { id: tripId } });
-      if (!trip) throw new HttpError(404, 'Trip not found.');
+    const result = await prisma.$transaction(async (tx) => {
+      const van = await tx.van.findUnique({ where: { id: vanId } });
+      if (!van) throw new HttpError(404, 'This QR code refers to a van that no longer exists.');
 
-      // Guard against scanning a QR code belonging to a different van
-      if (trip.vanId !== vanId) {
-        throw new HttpError(400, 'This QR code does not match the van assigned to this trip.');
-      }
-
-      let targetStatus;
-      if (action === 'DEPARTURE') {
-        if (trip.status !== 'DEPARTING') {
-          throw new HttpError(400, 'Trip is not ready for departure.');
-        }
-        targetStatus = 'DEPARTED';
-      } else {
-        // ARRIVAL
-        if (trip.status !== 'DEPARTED' && trip.status !== 'DELAYED') {
-          throw new HttpError(400, 'Trip has not departed yet.');
-        }
-        targetStatus = 'ARRIVING';
-      }
-
-      await tx.qrScanLog.create({
-        data: { tripId, vanId, scannedById: userId, action },
+      const trip = await tx.trip.findFirst({
+        where: { vanId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
+        orderBy: { id: 'desc' },
       });
 
-      const updated = await tx.trip.update({
-        where: { id: tripId },
-        data: {
-          status: targetStatus,
-          ...(action === 'DEPARTURE' ? { actualDeparture: new Date() } : {}),
-          ...(action === 'ARRIVAL'   ? { actualArrival:   new Date() } : {}),
-        },
+      if (!trip) {
+        throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
+      }
+
+      if (trip.status === 'BOARDING') {
+        throw new HttpError(
+          400,
+          `${van.plateNumber} is still boarding — the driver needs to mark "I've Departed" first before this scan can advance it.`,
+        );
+      }
+
+      const transition = SCAN_TRANSITIONS[trip.status];
+      if (!transition) {
+        throw new HttpError(400, `${van.plateNumber} is in an unexpected state (${trip.status}) and can't be advanced by scan.`);
+      }
+
+      const updateData = { status: transition.nextStatus };
+      if (transition.setField) updateData[transition.setField] = new Date();
+
+      const updatedTrip = await tx.trip.update({
+        where: { id: trip.id },
+        data: updateData,
         include: TRIP_INCLUDE,
       });
 
       await tx.tripStatusHistory.create({
-        data: { tripId, status: targetStatus, recordedById: userId },
+        data: { tripId: trip.id, status: transition.nextStatus, recordedById: userId },
       });
 
-      return updated;
+      await tx.qrScanLog.create({
+        data: { tripId: trip.id, vanId, scannedById: userId, action: transition.action },
+      });
+
+      // Once the trip is fully wrapped up, release the van so it can be
+      // assigned to a new trip again.
+      if (transition.nextStatus === 'COMPLETED') {
+        await tx.van.update({ where: { id: vanId }, data: { status: 'IDLE' } });
+      }
+
+      return { trip: updatedTrip, action: transition.action };
     });
 
     emitFleetEvent(req, 'trip_status_changed', {
-      tripId: updatedTrip.id,
-      status: updatedTrip.status,
-      trip:   updatedTrip,
+      tripId: result.trip.id,
+      status: result.trip.status,
+      trip:   result.trip,
     });
 
-    return res.status(200).json({ message: `QR ${action} successful.`, trip: updatedTrip });
+    return res.status(200).json({
+      message: `${result.trip.van?.plateNumber ?? 'Van'} → ${result.trip.status}`,
+      trip: result.trip,
+      action: result.action,
+    });
   } catch (error) {
     return handleError(res, error, 'handleQrScan', 'Failed to process QR scan.');
   }
