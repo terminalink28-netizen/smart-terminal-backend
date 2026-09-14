@@ -21,25 +21,37 @@ export const getSystemStats = async (req, res) => {
     ]);
 
     const staff = await prisma.user.findMany({
-      select: { id: true, name: true, email: true, driverId: true, role: true, isActive: true }
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        driverId: true,
+        role: true,
+        isActive: true,
+        assignedVanId: true,
+        assignedVan: { select: { id: true, plateNumber: true } },
+      }
     });
 
     const fleet = await prisma.van.findMany({
-  orderBy: { plateNumber: 'asc' }
-});
+      orderBy: { plateNumber: 'asc' },
+      include: {
+        driver: { select: { id: true, name: true } },
+      },
+    });
 
-// Attach each van's permanent scan token so the admin table can show
-// a "View QR" action for any van, not just newly-created ones.
-const fleetWithQr = fleet.map((van) => ({
-  ...van,
-  qrToken: signVanQrToken(van.id),
-}));
+    // Attach each van's permanent scan token so the admin table can show
+    // a "View QR" action for any van, not just newly-created ones.
+    const fleetWithQr = fleet.map((van) => ({
+      ...van,
+      qrToken: signVanQrToken(van.id),
+    }));
 
-return res.status(200).json({
-  stats: { totalUsers, totalVans, totalTrips, activeTrips },
-  staff,
-  fleet: fleetWithQr, // <-- changed from `fleet`
-});
+    return res.status(200).json({
+      stats: { totalUsers, totalVans, totalTrips, activeTrips },
+      staff,
+      fleet: fleetWithQr,
+    });
   } catch (error) {
     console.error('[Admin Stats Error]', error);
     return res.status(500).json({ error: 'Failed to fetch system stats.' });
@@ -49,33 +61,59 @@ return res.status(200).json({
 // ─── Staff Management ───
 export const createUser = async (req, res) => {
   try {
-    const { name, email, role, driverId, password } = req.body;
-    
+    const { name, email, role, driverId, password, vanId } = req.body;
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const newUser = await prisma.user.create({
-      data: {
-        name,
-        role,
-        email: role !== 'DRIVER' ? email : null,
-        driverId: role === 'DRIVER' ? driverId : null,
-        passwordHash: role !== 'DRIVER' ? hashedPassword : null,
-        pinHash: role === 'DRIVER' ? hashedPassword : null,
-        isActive: true
+    const newUser = await prisma.$transaction(async (tx) => {
+      // If a vanId was provided for a driver, make sure that van isn't
+      // already assigned to someone else — assignedVanId is unique, but
+      // checking first gives a clean error instead of a raw P2002.
+      if (role === 'DRIVER' && vanId) {
+        const existingHolder = await tx.user.findUnique({ where: { assignedVanId: vanId } });
+        if (existingHolder) {
+          throw new Error(`Van is already assigned to driver "${existingHolder.name}".`);
+        }
       }
+
+      return tx.user.create({
+        data: {
+          name,
+          role,
+          email: role !== 'DRIVER' ? email : null,
+          driverId: role === 'DRIVER' ? driverId : null,
+          assignedVanId: role === 'DRIVER' ? (vanId ?? null) : null,
+          passwordHash: role !== 'DRIVER' ? hashedPassword : null,
+          pinHash: role === 'DRIVER' ? hashedPassword : null,
+          isActive: true
+        },
+        include: { assignedVan: { select: { id: true, plateNumber: true } } },
+      });
     });
 
     return res.status(201).json(newUser);
   } catch (error) {
     console.error('[Create User Error]', error);
-    return res.status(500).json({ error: 'Failed to create user. Email or Driver ID may already exist.' });
+    const message = error?.message?.includes('already assigned')
+      ? error.message
+      : 'Failed to create user. Email, Driver ID, or assigned van may already be taken.';
+    return res.status(500).json({ error: message });
   }
 };
 
 export const updateUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, email, driverId, isActive } = req.body;
+    const { name, email, driverId, isActive, vanId } = req.body;
+
+    if (vanId !== undefined && vanId !== null) {
+      const existingHolder = await prisma.user.findUnique({ where: { assignedVanId: vanId } });
+      if (existingHolder && existingHolder.id !== id) {
+        return res.status(400).json({
+          error: `Van is already assigned to driver "${existingHolder.name}".`,
+        });
+      }
+    }
 
     const updatedUser = await prisma.user.update({
       where: { id },
@@ -83,9 +121,14 @@ export const updateUser = async (req, res) => {
         ...(name && { name }),
         ...(email && { email }),
         ...(driverId && { driverId }),
-        ...(isActive !== undefined && { isActive })
+        ...(isActive !== undefined && { isActive }),
+        ...(vanId !== undefined && { assignedVanId: vanId }), // vanId: null unassigns
       },
-      select: { id: true, name: true, email: true, driverId: true, role: true, isActive: true }
+      select: {
+        id: true, name: true, email: true, driverId: true, role: true, isActive: true,
+        assignedVanId: true,
+        assignedVan: { select: { id: true, plateNumber: true } },
+      }
     });
 
     return res.status(200).json(updatedUser);
@@ -110,20 +153,21 @@ export const deleteUser = async (req, res) => {
 export const createVan = async (req, res) => {
   try {
     const { plateNumber, capacity, status, driverName, driverPin } = req.body;
-    
+
     if (driverName && driverPin) {
       const hashedPassword = await bcrypt.hash(driverPin, 10);
-      
+
       const { van, driver } = await prisma.$transaction(async (tx) => {
         const newVan = await tx.van.create({
           data: { plateNumber, capacity, status }
         });
-        
+
         const newDriver = await tx.user.create({
           data: {
             name: driverName,
             role: 'DRIVER',
             driverId: plateNumber,
+            assignedVanId: newVan.id, // NEW — real link, set at creation time
             pinHash: hashedPassword,
             passwordHash: hashedPassword,
             isActive: true
@@ -135,7 +179,7 @@ export const createVan = async (req, res) => {
 
       return res.status(201).json({
         ...van,
-        qrToken: signVanQrToken(van.id), // <-- new: permanent scan token for this van
+        qrToken: signVanQrToken(van.id),
         driver: {
           id: driver.id,
           name: driver.name,
@@ -144,16 +188,16 @@ export const createVan = async (req, res) => {
           isActive: driver.isActive,
         },
       });
-    } 
-    
+    }
+
     const newVan = await prisma.van.create({
       data: { plateNumber, capacity, status }
     });
     return res.status(201).json({
       ...newVan,
-      qrToken: signVanQrToken(newVan.id), // <-- new
+      qrToken: signVanQrToken(newVan.id),
     });
-    
+
   } catch (error) {
     console.error('[Create Van Error]', error);
     return res.status(500).json({ error: 'Failed to register fleet unit. The Plate Number may already exist in the database.' });
