@@ -43,6 +43,11 @@ model User {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  // NEW — real FK link to the van this driver operates, replacing the old
+  // driverId === plateNumber string-matching approach.
+  assignedVanId String?  @unique
+  assignedVan   Van?     @relation("DriverVan", fields: [assignedVanId], references: [id])
+
   // Relations
   tripsAsDriver     Trip[]              @relation("TripDriver")
   statusUpdates     TripStatusHistory[] @relation("RecordedBy")
@@ -54,7 +59,10 @@ model Van {
   plateNumber   String    @unique
   capacity      Int
   status        VanStatus @default(IDLE)
-  
+
+  // NEW — reverse side of the driver relation
+  driver        User?     @relation("DriverVan")
+
   // Relations
   trips         Trip[]
   qrScans       QrScanLog[]
