@@ -96,18 +96,17 @@ function handleError(res, error, context, fallbackMessage = 'Internal server err
 // "At the terminal" means: IDLE (parked, no active trip — just completed one
 // or never started one) OR BOARDING (assigned a route, still loading
 // passengers on-site). The moment a van's trip moves to DEPARTING or beyond,
-// it has physically left, so it drops out of this list entirely — it shows
-// up instead in the live-tracking / map views that already exist.
+// it has physically left, so it drops out of this list entirely.
 //
-// A van's "home" driver is resolved via User.driverId === Van.plateNumber
-// (see selfStartTrip) rather than through the trip, since an IDLE van has
-// no active trip to read a driver off of.
+// A van's driver is now resolved via the real Van.driver relation
+// (User.assignedVanId), not string-matching driverId to plateNumber.
 
 export const getTerminalVans = async (req, res) => {
   try {
     const [idleVans, boardingTrips] = await Promise.all([
       prisma.van.findMany({
         where: { status: 'IDLE' },
+        include: { driver: { select: { id: true, name: true } } },
         orderBy: { plateNumber: 'asc' },
       }),
       prisma.trip.findMany({
@@ -117,21 +116,12 @@ export const getTerminalVans = async (req, res) => {
       }),
     ]);
 
-    const idlePlateNumbers = idleVans.map((v) => v.plateNumber);
-    const idleDrivers = idlePlateNumbers.length
-      ? await prisma.user.findMany({
-          where: { role: 'DRIVER', driverId: { in: idlePlateNumbers } },
-          select: { id: true, name: true, driverId: true },
-        })
-      : [];
-    const driverByPlate = new Map(idleDrivers.map((d) => [d.driverId, d]));
-
     const idleEntries = idleVans.map((van) => ({
       vanId: van.id,
       plateNumber: van.plateNumber,
       capacity: van.capacity,
       terminalStatus: 'IDLE',
-      driver: driverByPlate.get(van.plateNumber) ?? null,
+      driver: van.driver ?? null,
       trip: null,
     }));
 
@@ -150,8 +140,6 @@ export const getTerminalVans = async (req, res) => {
       },
     }));
 
-    // Boarding vans first — they're mid-process and more actionable
-    // for a dispatcher glancing at the list.
     return res.status(200).json([...boardingEntries, ...idleEntries]);
   } catch (error) {
     return handleError(res, error, 'getTerminalVans', 'Failed to load vans at the terminal.');
@@ -327,6 +315,10 @@ export const getMyTrips = async (req, res) => {
 };
 
 // ─── 4. Driver self-starts their own trip ────────────────────────────────────
+//
+// The driver's van is now resolved via the real assignedVan relation
+// instead of matching driverId text against Van.plateNumber — a typo or
+// formatting drift can no longer silently orphan a driver from their van.
 
 export const selfStartTrip = async (req, res) => {
   try {
@@ -336,30 +328,28 @@ export const selfStartTrip = async (req, res) => {
       return res.status(400).json({ error: 'origin, destination, and routeName are all required.' });
     }
 
-    // UUID mapped for the Trip table relation
     const driverUserId = req.user.id;
-    // String mapped for the Van table search (e.g., 'VAN-001')
-    const vanPlateNumber = req.user.driverId;
 
-    if (!vanPlateNumber) {
+    const driverWithVan = await prisma.user.findUnique({
+      where: { id: driverUserId },
+      include: { assignedVan: true },
+    });
+
+    if (!driverWithVan?.assignedVan) {
       return res.status(400).json({
-        error: 'Your account is not assigned to a specific van plate number. Contact the dispatcher.',
+        error: 'Your account is not assigned to a van. Contact the dispatcher.',
       });
     }
 
-    const van = await prisma.van.findFirst({
-      where: { plateNumber: vanPlateNumber },
-    });
+    const van = driverWithVan.assignedVan;
 
-    if (!van) {
+    if (van.status !== 'IDLE') {
       return res.status(400).json({
-        error: `Could not find a van with plate number ${vanPlateNumber} in the terminal database.`,
+        error: `Van ${van.plateNumber} is currently in use. Contact the dispatcher.`,
       });
     }
 
     const newTrip = await prisma.$transaction(async (tx) => {
-      // 1. Prevent starting a new trip if the driver already has one active.
-      //    Checked first, inside the transaction, to minimise the race window.
       const existingTrip = await tx.trip.findFirst({
         where: {
           driverId: driverUserId,
@@ -371,19 +361,15 @@ export const selfStartTrip = async (req, res) => {
         throw new HttpError(400, 'You already have an active trip. Please complete it first.');
       }
 
-      // 2. Atomically claim the van: only succeeds if it's still IDLE.
-      //    Prevents two concurrent requests from double-booking the same van.
       const vanClaim = await tx.van.updateMany({
         where: { id: van.id, status: 'IDLE' },
         data:  { status: 'ON_TRIP' },
       });
 
       if (vanClaim.count === 0) {
-        throw new HttpError(400, `Van ${vanPlateNumber} is currently in use. Contact the dispatcher.`);
+        throw new HttpError(400, `Van ${van.plateNumber} is currently in use. Contact the dispatcher.`);
       }
 
-      // 3. Find or create the route. Handle a race on the unique route name
-      //    gracefully (P2002) by re-fetching the row another request created.
       let route = await tx.route.findFirst({ where: { name: routeName } });
 
       if (!route) {
@@ -404,7 +390,6 @@ export const selfStartTrip = async (req, res) => {
         throw new HttpError(500, 'Failed to resolve route for this trip.');
       }
 
-      // 4. Create the trip now that the van is reserved and the route exists.
       return tx.trip.create({
         data: {
           routeId: route.id,
