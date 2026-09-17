@@ -30,25 +30,33 @@ enum TripStatus {
   CANCELLED
 }
 
-// --- MODELS ---
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model User {
   id            String   @id @default(uuid())
   role          Role
   name          String
-  email         String?  @unique // Nullable for drivers
-  driverId      String?  @unique // Nullable for admin/dispatchers
-  passwordHash  String?  // For email login
-  pinHash       String?  // For driver login
+  email         String?  @unique
+  driverId      String?  @unique
+  passwordHash  String?
+  pinHash       String?
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  // NEW — real FK link to the van this driver operates, replacing the old
-  // driverId === plateNumber string-matching approach.
+  // NEW
+  contactNumber   String?
+  licensePhotoUrl String?
+  approvalStatus  ApprovalStatus @default(APPROVED) // admin/dispatcher accounts skip review; self-registered drivers start PENDING
+  rejectionReason String?
+
   assignedVanId String?  @unique
   assignedVan   Van?     @relation("DriverVan", fields: [assignedVanId], references: [id])
 
-  // Relations
   tripsAsDriver     Trip[]              @relation("TripDriver")
   statusUpdates     TripStatusHistory[] @relation("RecordedBy")
   qrScans           QrScanLog[]         @relation("ScannedBy")
