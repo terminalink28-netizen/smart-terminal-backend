@@ -76,6 +76,15 @@ export const login = async (req, res) => {
     }
 
     console.log(`Result: Success! Generating token...`);
+
+    const approvalStatus = user.approvalStatus ?? user.approval_status ?? 'APPROVED';
+if (approvalStatus === 'PENDING') {
+  return res.status(403).json({ error: 'Your account is pending admin approval.' });
+}
+if (approvalStatus === 'REJECTED') {
+  return res.status(403).json({ error: 'Your registration was rejected. Contact the admin.' });
+}
+
     
     const tokenPayload = {
       id: user.id,
