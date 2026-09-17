@@ -8,6 +8,7 @@ import authRoutes from './src/routes/auth.routes.js';
 import tripRoutes from './src/routes/trip.routes.js';
 import trackingRoutes from './src/routes/tracking.routes.js';
 import adminRoutes from './src/routes/admin.routes.js';
+import driverRoutes from './src/routes/driver.routes.js';
 
 import {
   initializeSockets,
@@ -52,6 +53,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/trips', tripRoutes);
 app.use('/api/tracking', trackingRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/drivers', driverRoutes);
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({
