@@ -26,6 +26,10 @@ router.post('/users', createUser);
 router.patch('/users/:id', updateUser);
 router.delete('/users/:id', deleteUser);
 
+router.get('/drivers/pending', getPendingDrivers);
+router.patch('/drivers/:id/approve', approveDriver);
+router.patch('/drivers/:id/reject', rejectDriver);
+
 // ─── Fleet / Vans Management ───
 router.post('/vans', createVan);
 router.patch('/vans/:id', updateVan);
