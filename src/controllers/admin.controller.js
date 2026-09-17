@@ -238,3 +238,50 @@ export const getAuditLogs = async (req, res) => {
     return res.status(500).json({ error: 'Failed to load audit logs.' });
   }
 };
+
+
+export const getPendingDrivers = async (req, res) => {
+  try {
+    const pending = await prisma.user.findMany({
+      where: { role: 'DRIVER', approvalStatus: 'PENDING' },
+      select: {
+        id: true, name: true, driverId: true, contactNumber: true,
+        licensePhotoUrl: true, createdAt: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    return res.status(200).json(pending);
+  } catch (error) {
+    console.error('[Get Pending Drivers Error]', error);
+    return res.status(500).json({ error: 'Failed to load pending driver applications.' });
+  }
+};
+
+export const approveDriver = async (req, res) => {
+  try {
+    const updated = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { approvalStatus: 'APPROVED' },
+      select: { id: true, name: true, driverId: true, approvalStatus: true },
+    });
+    return res.status(200).json({ message: `${updated.name} approved.`, driver: updated });
+  } catch (error) {
+    console.error('[Approve Driver Error]', error);
+    return res.status(500).json({ error: 'Failed to approve driver.' });
+  }
+};
+
+export const rejectDriver = async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const updated = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { approvalStatus: 'REJECTED', isActive: false, rejectionReason: reason ?? null },
+      select: { id: true, name: true, driverId: true, approvalStatus: true },
+    });
+    return res.status(200).json({ message: `${updated.name} rejected.`, driver: updated });
+  } catch (error) {
+    console.error('[Reject Driver Error]', error);
+    return res.status(500).json({ error: 'Failed to reject driver.' });
+  }
+};
