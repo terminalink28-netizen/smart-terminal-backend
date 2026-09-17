@@ -1,14 +1,16 @@
 import express from 'express';
 import { 
   getSystemStats,
-  // Make sure you have these functions in your admin.controller.js!
   createUser,
   updateUser,
   deleteUser,
   createVan,
   updateVan,
   deleteVan,
-  getAuditLogs
+  getAuditLogs,
+  getPendingDrivers,
+  approveDriver,
+  rejectDriver
 } from '../controllers/admin.controller.js';
 import { requireAuth, requireRoles } from '../middleware/auth.middleware.js';
 
