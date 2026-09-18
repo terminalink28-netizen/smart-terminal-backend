@@ -21,17 +21,19 @@ export const getSystemStats = async (req, res) => {
     ]);
 
     const staff = await prisma.user.findMany({
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        driverId: true,
-        role: true,
-        isActive: true,
-        assignedVanId: true,
-        assignedVan: { select: { id: true, plateNumber: true } },
-      }
-    });
+  select: {
+    id: true,
+    name: true,
+    email: true,
+    driverId: true,
+    contactNumber: true,   // ADD THIS
+    role: true,
+    isActive: true,
+    approvalStatus: true,  // ADD THIS — needed for the analytics breakdown
+    assignedVanId: true,
+    assignedVan: { select: { id: true, plateNumber: true } },
+  }
+});
 
     const fleet = await prisma.van.findMany({
       orderBy: { plateNumber: 'asc' },
