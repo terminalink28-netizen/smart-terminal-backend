@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "postinstall": "npx prisma generate"
-  },
+  "start": "npx prisma db push --accept-data-loss && node index.js",
+  "dev": "nodemon index.js",
+  "postinstall": "npx prisma generate"
+},
   "keywords": [],
   "author": "",
   "dependencies": {
