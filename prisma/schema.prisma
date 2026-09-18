@@ -143,3 +143,14 @@ model QrScanLog {
   van         Van      @relation(fields: [vanId], references: [id])
   scannedBy   User     @relation("ScannedBy", fields: [scannedById], references: [id])
 }
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actorName  String
+  action     String
+  targetType String?
+  target     String?
+  details    String?
+  timestamp  DateTime @default(now())
+}
