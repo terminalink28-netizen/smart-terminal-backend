@@ -276,13 +276,38 @@ export const approveDriver = async (req, res) => {
 export const rejectDriver = async (req, res) => {
   try {
     const { reason } = req.body;
-    const updated = await prisma.user.update({
-      where: { id: req.params.id },
-      data: { approvalStatus: 'REJECTED', isActive: false, rejectionReason: reason ?? null },
-      select: { id: true, name: true, driverId: true, approvalStatus: true },
+
+    const result = await prisma.$transaction(async (tx) => {
+      const driver = await tx.user.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, name: true, driverId: true, assignedVanId: true },
+      });
+
+      if (!driver) {
+        throw new HttpError(404, 'Driver not found.');
+      }
+
+      const updated = await tx.user.update({
+        where: { id: driver.id },
+        data: { approvalStatus: 'REJECTED', isActive: false, rejectionReason: reason ?? null },
+        select: { id: true, name: true, driverId: true, approvalStatus: true },
+      });
+
+      // The van was created solely for this application — with no driver
+      // left attached, it has no purpose and would otherwise sit as dead
+      // weight in the Registered Vans list. Clean it up automatically.
+      if (driver.assignedVanId) {
+        await tx.van.delete({ where: { id: driver.assignedVanId } });
+      }
+
+      return updated;
     });
-    return res.status(200).json({ message: `${updated.name} rejected.`, driver: updated });
+
+    return res.status(200).json({ message: `${result.name} rejected.`, driver: result });
   } catch (error) {
+    if (error instanceof HttpError) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
     console.error('[Reject Driver Error]', error);
     return res.status(500).json({ error: 'Failed to reject driver.' });
   }
