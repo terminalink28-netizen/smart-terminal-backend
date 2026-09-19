@@ -14,7 +14,9 @@ export const registerDriver = async (req, res) => {
     const { name, driverId, pin, contactNumber, plateNumber, capacity } = req.body;
 
     if (!name || !driverId || !pin || !contactNumber || !plateNumber || !capacity) {
-      return res.status(400).json({ error: 'name, driverId, pin, contactNumber, plateNumber, and capacity are all required.' });
+      return res.status(400).json({
+        error: 'name, driverId, pin, contactNumber, plateNumber, and capacity are all required.',
+      });
     }
     if (!PLATE_RE.test(plateNumber.trim())) {
       return res.status(400).json({ error: 'Invalid plate number format.' });
@@ -27,12 +29,14 @@ export const registerDriver = async (req, res) => {
       return res.status(400).json({ error: "A photo of your driver's license is required." });
     }
 
+    const normalizedPlate = plateNumber.trim().toUpperCase();
+
     const existingDriverId = await prisma.user.findUnique({ where: { driverId } });
     if (existingDriverId) {
       return res.status(409).json({ error: 'That Driver ID is already registered.' });
     }
 
-    const existingPlate = await prisma.van.findUnique({ where: { plateNumber: plateNumber.trim().toUpperCase() } });
+    const existingPlate = await prisma.van.findUnique({ where: { plateNumber: normalizedPlate } });
     if (existingPlate) {
       return res.status(409).json({ error: 'That plate number is already registered.' });
     }
@@ -40,9 +44,13 @@ export const registerDriver = async (req, res) => {
     const pinHash = await bcrypt.hash(pin, 10);
 
     const newDriver = await prisma.$transaction(async (tx) => {
+      // Van starts IDLE. It will be flipped to ON_TRIP the first time the
+      // driver self-starts or a dispatcher assigns them a trip — at which
+      // point `start_tracking` is broadcast and the driver's phone begins
+      // streaming GPS automatically (no manual tap needed).
       const van = await tx.van.create({
         data: {
-          plateNumber: plateNumber.trim().toUpperCase(),
+          plateNumber: normalizedPlate,
           capacity: cap,
           status: 'IDLE',
         },
