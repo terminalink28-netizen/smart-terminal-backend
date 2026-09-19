@@ -25,6 +25,11 @@ const ALL_STATUSES = Object.keys(VALID_TRANSITIONS);
 // Statuses that mean a driver/van is already actively on a trip
 const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
+// Single source of truth for how a trip is hydrated everywhere it's read.
+// Every query in this file that returns a trip (or a list of trips) MUST use
+// this constant rather than writing its own include — getLiveTrips previously
+// duplicated this by hand, which is exactly the kind of copy that silently
+// falls out of sync the next time this shape changes.
 const TRIP_INCLUDE = {
   driver: { select: { id: true, name: true } },
   route:  true,
@@ -203,12 +208,12 @@ export const updateTripStatus = async (req, res) => {
 // ─── 2. QR scan handler ───────────────────────────────────────────────────────
 //
 // Scans a signed, permanent van QR token (issued once at van creation —
-// see admin.controller.js's createVan / getVanQrToken). No tripId or
-// action is ever trusted from the client: the token only identifies the
-// van, and the backend looks up that van's CURRENT active trip to decide
-// what a scan should do. This means one printed sticker on the van works
-// correctly at every checkpoint of every future trip, and a scan can
-// never be used to force an arbitrary status transition.
+// see driver.controller.js's registerDriver, which now creates the van).
+// No tripId or action is ever trusted from the client: the token only
+// identifies the van, and the backend looks up that van's CURRENT active
+// trip to decide what a scan should do. This means one printed sticker on
+// the van works correctly at every checkpoint of every future trip, and a
+// scan can never be used to force an arbitrary status transition.
 
 export const handleQrScan = async (req, res) => {
   try {
@@ -319,6 +324,8 @@ export const getMyTrips = async (req, res) => {
 // The driver's van is now resolved via the real assignedVan relation
 // instead of matching driverId text against Van.plateNumber — a typo or
 // formatting drift can no longer silently orphan a driver from their van.
+// The van itself is created once, at registration time (driver.controller.js),
+// always with status 'IDLE' — this function is what first moves it to 'ON_TRIP'.
 
 export const selfStartTrip = async (req, res) => {
   try {
@@ -485,6 +492,12 @@ export const createTrip = async (req, res) => {
 };
 
 // ─── 7. Fetch all active live trips (Public & Dispatcher) ─────────────────────
+//
+// Now reuses TRIP_INCLUDE instead of a hand-duplicated include object — the
+// two happened to be identical, but there was nothing enforcing that, and a
+// future edit to one without the other would have silently produced a
+// mismatch between this endpoint and every other trip-returning one in the
+// file (e.g. driver/dispatcher trips missing a field the public map expects).
 
 export const getLiveTrips = async (req, res) => {
   try {
@@ -492,12 +505,8 @@ export const getLiveTrips = async (req, res) => {
       where: {
         status: { notIn: ['COMPLETED', 'CANCELLED'] }
       },
-      include: {
-        driver: { select: { id: true, name: true } },
-        route: true,
-        van: true
-      },
-      orderBy: { id: 'desc' } // Make sure this matches your schema (id instead of createdAt)
+      include: TRIP_INCLUDE,
+      orderBy: { id: 'desc' }
     });
 
     return res.status(200).json(activeTrips);
