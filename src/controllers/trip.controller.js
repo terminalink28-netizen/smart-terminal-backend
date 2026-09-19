@@ -1,95 +1,18 @@
+// src/controllers/trip.controller.js
 import { PrismaClient, Prisma } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { verifyVanQrToken, signVanQrToken } from '../utils/qr.util.js';
+import {
+  recordLocation,
+  getLiveLocation,
+  clearTripLocation,
+} from '../liveLocations.js';
+import { getIo } from '../sockets/socket.js';
 
 const pool    = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma  = new PrismaClient({ adapter });
-
-// ─── Live GPS store ───────────────────────────────────────────────────────────
-// Keeps the last known fix per trip so `subscribe_to_map` clients can be
-// seeded instantly and the dispatcher doesn't have to wait for the next ping.
-// Swap for Redis if you ever run more than one backend instance.
-const liveLocations = new Map(); // tripId -> { lat, lng, speed, smoothedSpeed, accuracy, heading, timestamp, positionTrusted }
-
-const LOCATION_STALE_MS      = 120_000; // matches the client's GPS_STALE_THRESHOLD_MS
-const SPEED_SMOOTHING_ALPHA  = 0.4;
-const UNUSABLE_ACCURACY_M    = 250;
-
-export function getLiveLocationsSnapshot() {
-  const now = Date.now();
-  const out = [];
-  for (const [tripId, data] of liveLocations) {
-    if (now - data.timestamp > LOCATION_STALE_MS) {
-      liveLocations.delete(tripId);
-      continue;
-    }
-    out.push([tripId, data]);
-  }
-  return out;
-}
-
-function clearTripLocation(tripId) {
-  liveLocations.delete(tripId);
-}
-
-function recordLocation(tripId, { lat, lng, speed, accuracy, heading }) {
-  const now = Date.now();
-  const prev = liveLocations.get(tripId);
-  const rawSpeed = typeof speed === 'number' ? speed : null;
-
-  const smoothedSpeed =
-    rawSpeed === null
-      ? prev?.smoothedSpeed ?? null
-      : prev?.smoothedSpeed == null
-      ? rawSpeed
-      : prev.smoothedSpeed * (1 - SPEED_SMOOTHING_ALPHA) + rawSpeed * SPEED_SMOOTHING_ALPHA;
-
-  const entry = {
-    lat,
-    lng,
-    speed: rawSpeed,
-    smoothedSpeed,
-    accuracy: typeof accuracy === 'number' ? accuracy : null,
-    heading: typeof heading === 'number' ? heading : prev?.heading ?? null,
-    timestamp: now,
-    positionTrusted:
-      typeof accuracy !== 'number' ? true : accuracy <= UNUSABLE_ACCURACY_M,
-  };
-
-  liveLocations.set(tripId, entry);
-  return entry;
-}
-
-/**
- * Tells the driver's app to begin streaming GPS. The driver app joins
- * `driver:${userId}` on connect; this event is what makes location sharing
- * automatic the moment a trip becomes BOARDING — no manual tap needed.
- */
-function broadcastStartTracking(req, trip) {
-  try {
-    const io = req.app?.get?.('io');
-    if (!io) return;
-    io.to(`driver:${trip.driverId}`).emit('start_tracking', {
-      tripId: trip.id,
-      status: trip.status,
-      reason: 'Trip is boarding — start sharing your location.',
-    });
-  } catch (err) {
-    console.error('[broadcastStartTracking]', err);
-  }
-}
-
-function broadcastStopTracking(req, tripId, driverId) {
-  try {
-    const io = req.app?.get?.('io');
-    if (!io) return;
-    io.to(`driver:${driverId}`).emit('stop_tracking', { tripId });
-  } catch (err) {
-    console.error('[broadcastStopTracking]', err);
-  }
-}
 
 // ─── State machine ────────────────────────────────────────────────────────────
 
@@ -103,8 +26,6 @@ const VALID_TRANSITIONS = {
   COMPLETED:  [],
   CANCELLED:  [],
 };
-
-const ALL_STATUSES = Object.keys(VALID_TRANSITIONS);
 
 const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
@@ -135,9 +56,9 @@ function withVanQrToken(trip) {
   return { ...trip, van: { ...trip.van, qrToken: signVanQrToken(trip.van.id) } };
 }
 
-function emitFleetEvent(req, event, payload) {
+function emitFleetEvent(event, payload) {
   try {
-    const io = req.app?.get?.('io');
+    const io = getIo();
     if (!io) return;
     io.emit(event, payload);
   } catch (err) {
@@ -151,6 +72,37 @@ function handleError(res, error, context, fallbackMessage = 'Internal server err
   }
   console.error(`[${context}]`, error);
   return res.status(500).json({ error: fallbackMessage });
+}
+
+/**
+ * Tells the driver's phone to begin streaming GPS. Fires the instant a trip
+ * enters BOARDING (self-start, dispatcher create, or status change). The
+ * driver app listens for `start_tracking` and turns on watchPosition itself
+ * — no manual tap needed.
+ */
+function broadcastStartTracking(trip) {
+  try {
+    const io = getIo();
+    if (!io || !trip?.driverId) return;
+    io.to(`driver:${trip.driverId}`).emit('start_tracking', {
+      tripId: trip.id,
+      status: trip.status,
+      reason: 'Trip is boarding — start sharing your location.',
+    });
+    console.log(`[start_tracking] driver=${trip.driverId} trip=${trip.id}`);
+  } catch (err) {
+    console.error('[broadcastStartTracking]', err);
+  }
+}
+
+function broadcastStopTracking(tripId, driverId) {
+  try {
+    const io = getIo();
+    if (!io || !driverId) return;
+    io.to(`driver:${driverId}`).emit('stop_tracking', { tripId });
+  } catch (err) {
+    console.error('[broadcastStopTracking]', err);
+  }
 }
 
 // ─── 0. Dispatcher: vans currently AT the terminal ────────────────────────────
@@ -200,22 +152,15 @@ export const getTerminalVans = async (req, res) => {
   }
 };
 
-// ─── 0b. Driver GPS ingestion (called by the driver app while BOARDING) ──────
-//
-// This is the single write path for live positions. The driver app is
-// expected to `navigator.geolocation.watchPosition(...)` and POST here as
-// soon as it receives the `start_tracking` event. We never infer a position
-// from anything else — whatever the phone reports is what the public map
-// shows, or nothing at all.
+// ─── 0b. Driver GPS ingestion (HTTP path) ────────────────────────────────────
 
 export const updateDriverLocation = async (req, res) => {
   try {
     const { tripId, lat, lng, speed, accuracy, heading } = req.body;
-    const userId = req.user.id;
+    const userId = req.user?.id;
 
-    if (!tripId) {
-      return res.status(400).json({ error: 'tripId is required.' });
-    }
+    if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+    if (!tripId) return res.status(400).json({ error: 'tripId is required.' });
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       return res.status(400).json({ error: 'lat and lng must be numbers.' });
     }
@@ -238,10 +183,15 @@ export const updateDriverLocation = async (req, res) => {
 
     const entry = recordLocation(tripId, { lat, lng, speed, accuracy, heading });
 
-    // Fan out to everyone on the public map in real time.
-    emitFleetEvent(req, 'van_moved', { tripId, ...entry });
+    // Fan out to the public map room only.
+    try {
+      const io = getIo();
+      io?.to('map').emit('van_moved', { tripId, ...entry });
+    } catch (err) {
+      console.error('[updateDriverLocation emit]', err);
+    }
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, entry });
   } catch (error) {
     return handleError(res, error, 'updateDriverLocation', 'Failed to record location.');
   }
@@ -287,24 +237,21 @@ export const updateTripStatus = async (req, res) => {
       return updated;
     });
 
-    emitFleetEvent(req, 'trip_status_changed', {
+    emitFleetEvent('trip_status_changed', {
       tripId: updatedTrip.id,
       status: updatedTrip.status,
       trip:   updatedTrip,
     });
 
-    // Auto-start location sharing the moment a trip begins boarding — the
-    // driver's app listens for this and turns on `watchPosition` itself.
+    // Auto-start GPS the moment boarding begins — no manual tap needed.
     if (updatedTrip.status === 'BOARDING' || updatedTrip.status === 'DEPARTING') {
-      broadcastStartTracking(req, updatedTrip);
+      broadcastStartTracking(updatedTrip);
     }
 
-    // Trip is over — tell the driver's app to stop streaming and drop the
-    // stale fix so it can't leak into the next trip's map view.
     if (updatedTrip.status === 'COMPLETED' || updatedTrip.status === 'CANCELLED') {
       clearTripLocation(updatedTrip.id);
-      broadcastStopTracking(req, updatedTrip.id, updatedTrip.driverId);
-      emitFleetEvent(req, 'trip_removed', { tripId: updatedTrip.id });
+      broadcastStopTracking(updatedTrip.id, updatedTrip.driverId);
+      emitFleetEvent('trip_removed', { tripId: updatedTrip.id });
     }
 
     return res.status(200).json({ message: 'Status updated', trip: withVanQrToken(updatedTrip) });
@@ -320,14 +267,10 @@ export const handleQrScan = async (req, res) => {
     const { qrToken } = req.body;
     const userId = req.user.id;
 
-    if (!qrToken) {
-      return res.status(400).json({ error: 'qrToken is required.' });
-    }
+    if (!qrToken) return res.status(400).json({ error: 'qrToken is required.' });
 
     const vanId = verifyVanQrToken(qrToken);
-    if (!vanId) {
-      return res.status(400).json({ error: 'Invalid or unrecognized QR code.' });
-    }
+    if (!vanId) return res.status(400).json({ error: 'Invalid or unrecognized QR code.' });
 
     const result = await prisma.$transaction(async (tx) => {
       const van = await tx.van.findUnique({ where: { id: vanId } });
@@ -338,9 +281,7 @@ export const handleQrScan = async (req, res) => {
         orderBy: { id: 'desc' },
       });
 
-      if (!trip) {
-        throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
-      }
+      if (!trip) throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
 
       if (trip.status === 'BOARDING') {
         throw new HttpError(
@@ -378,7 +319,7 @@ export const handleQrScan = async (req, res) => {
       return { trip: updatedTrip, action: transition.action };
     });
 
-    emitFleetEvent(req, 'trip_status_changed', {
+    emitFleetEvent('trip_status_changed', {
       tripId: result.trip.id,
       status: result.trip.status,
       trip:   result.trip,
@@ -386,8 +327,8 @@ export const handleQrScan = async (req, res) => {
 
     if (result.trip.status === 'COMPLETED') {
       clearTripLocation(result.trip.id);
-      broadcastStopTracking(req, result.trip.id, result.trip.driverId);
-      emitFleetEvent(req, 'trip_removed', { tripId: result.trip.id });
+      broadcastStopTracking(result.trip.id, result.trip.driverId);
+      emitFleetEvent('trip_removed', { tripId: result.trip.id });
     }
 
     return res.status(200).json({
@@ -400,17 +341,14 @@ export const handleQrScan = async (req, res) => {
   }
 };
 
-// ─── 3. Fetch driver's own active trips ───────────────────────────────────────
+// ─── 3. Driver's own active trips ─────────────────────────────────────────────
 
 export const getMyTrips = async (req, res) => {
   try {
     const driverId = req.user.id;
 
     const trips = await prisma.trip.findMany({
-      where: {
-        driverId,
-        status: { notIn: ['COMPLETED', 'CANCELLED'] },
-      },
+      where: { driverId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       include: TRIP_INCLUDE,
       orderBy: { id: 'desc' },
     });
@@ -454,10 +392,7 @@ export const selfStartTrip = async (req, res) => {
 
     const newTrip = await prisma.$transaction(async (tx) => {
       const existingTrip = await tx.trip.findFirst({
-        where: {
-          driverId: driverUserId,
-          status: { notIn: ['COMPLETED', 'CANCELLED'] },
-        },
+        where: { driverId: driverUserId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       });
 
       if (existingTrip) {
@@ -477,9 +412,7 @@ export const selfStartTrip = async (req, res) => {
 
       if (!route) {
         try {
-          route = await tx.route.create({
-            data: { name: routeName, origin, destination },
-          });
+          route = await tx.route.create({ data: { name: routeName, origin, destination } });
         } catch (err) {
           if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
             route = await tx.route.findFirst({ where: { name: routeName } });
@@ -489,9 +422,7 @@ export const selfStartTrip = async (req, res) => {
         }
       }
 
-      if (!route) {
-        throw new HttpError(500, 'Failed to resolve route for this trip.');
-      }
+      if (!route) throw new HttpError(500, 'Failed to resolve route for this trip.');
 
       return tx.trip.create({
         data: {
@@ -505,15 +436,15 @@ export const selfStartTrip = async (req, res) => {
       });
     });
 
-    emitFleetEvent(req, 'trip_dispatched', { trip: newTrip });
-    emitFleetEvent(req, 'trip_status_changed', {
+    emitFleetEvent('trip_dispatched', { trip: newTrip });
+    emitFleetEvent('trip_status_changed', {
       tripId: newTrip.id,
       status: newTrip.status,
       trip:   newTrip,
     });
 
-    // Boarding starts immediately — auto-start the driver's GPS stream now.
-    broadcastStartTracking(req, newTrip);
+    // Boarding starts immediately — tell the driver's phone to begin GPS.
+    broadcastStartTracking(newTrip);
 
     return res.status(201).json(withVanQrToken(newTrip));
   } catch (error) {
@@ -536,7 +467,7 @@ export const getDispatchResources = async (req, res) => {
   }
 };
 
-// ─── 6. Dispatcher: create trip (assigns specific van + driver) ───────────────
+// ─── 6. Dispatcher: create trip ───────────────────────────────────────────────
 
 export const createTrip = async (req, res) => {
   try {
@@ -565,9 +496,7 @@ export const createTrip = async (req, res) => {
       }
 
       const route = await tx.route.findUnique({ where: { id: routeId } });
-      if (!route) {
-        throw new HttpError(400, 'Dispatch failed: route not found.');
-      }
+      if (!route) throw new HttpError(400, 'Dispatch failed: route not found.');
 
       return tx.trip.create({
         data: { routeId, vanId, driverId, status: 'BOARDING', scheduledTime: new Date() },
@@ -575,15 +504,14 @@ export const createTrip = async (req, res) => {
       });
     });
 
-    emitFleetEvent(req, 'trip_dispatched', { trip });
-    emitFleetEvent(req, 'trip_status_changed', {
+    emitFleetEvent('trip_dispatched', { trip });
+    emitFleetEvent('trip_status_changed', {
       tripId: trip.id,
       status: trip.status,
       trip,
     });
 
-    // Dispatcher just created a BOARDING trip — auto-start the driver's GPS.
-    broadcastStartTracking(req, trip);
+    broadcastStartTracking(trip);
 
     return res.status(201).json({ message: 'Trip successfully dispatched!', trip });
   } catch (error) {
@@ -591,28 +519,24 @@ export const createTrip = async (req, res) => {
   }
 };
 
-// ─── 7. Fetch all active live trips (Public & Dispatcher) ─────────────────────
+// ─── 7. Public live trips (WITH last known GPS fix) ───────────────────────────
+//
+// This is what the public tracking page fetches. Each trip carries a
+// `liveLocation` field with the freshest phone fix we have, so a cold page
+// load plots markers immediately — no need to wait for the next socket push.
 
 export const getLiveTrips = async (req, res) => {
   try {
     const activeTrips = await prisma.trip.findMany({
-      where: {
-        status: { notIn: ['COMPLETED', 'CANCELLED'] },
-      },
+      where: { status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       include: TRIP_INCLUDE,
       orderBy: { id: 'desc' },
     });
 
-    // Attach the last known phone fix (if any) so polling clients can still
-    // plot a marker without waiting for the next socket push.
-    const withLive = activeTrips.map((trip) => {
-      const loc = liveLocations.get(trip.id);
-      const isStale = loc && Date.now() - loc.timestamp > LOCATION_STALE_MS;
-      return {
-        ...trip,
-        liveLocation: loc && !isStale ? loc : null,
-      };
-    });
+    const withLive = activeTrips.map((trip) => ({
+      ...trip,
+      liveLocation: getLiveLocation(trip.id),
+    }));
 
     return res.status(200).json(withLive);
   } catch (error) {
