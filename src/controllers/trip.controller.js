@@ -7,6 +7,90 @@ const pool    = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma  = new PrismaClient({ adapter });
 
+// ─── Live GPS store ───────────────────────────────────────────────────────────
+// Keeps the last known fix per trip so `subscribe_to_map` clients can be
+// seeded instantly and the dispatcher doesn't have to wait for the next ping.
+// Swap for Redis if you ever run more than one backend instance.
+const liveLocations = new Map(); // tripId -> { lat, lng, speed, smoothedSpeed, accuracy, heading, timestamp, positionTrusted }
+
+const LOCATION_STALE_MS      = 120_000; // matches the client's GPS_STALE_THRESHOLD_MS
+const SPEED_SMOOTHING_ALPHA  = 0.4;
+const UNUSABLE_ACCURACY_M    = 250;
+
+export function getLiveLocationsSnapshot() {
+  const now = Date.now();
+  const out = [];
+  for (const [tripId, data] of liveLocations) {
+    if (now - data.timestamp > LOCATION_STALE_MS) {
+      liveLocations.delete(tripId);
+      continue;
+    }
+    out.push([tripId, data]);
+  }
+  return out;
+}
+
+function clearTripLocation(tripId) {
+  liveLocations.delete(tripId);
+}
+
+function recordLocation(tripId, { lat, lng, speed, accuracy, heading }) {
+  const now = Date.now();
+  const prev = liveLocations.get(tripId);
+  const rawSpeed = typeof speed === 'number' ? speed : null;
+
+  const smoothedSpeed =
+    rawSpeed === null
+      ? prev?.smoothedSpeed ?? null
+      : prev?.smoothedSpeed == null
+      ? rawSpeed
+      : prev.smoothedSpeed * (1 - SPEED_SMOOTHING_ALPHA) + rawSpeed * SPEED_SMOOTHING_ALPHA;
+
+  const entry = {
+    lat,
+    lng,
+    speed: rawSpeed,
+    smoothedSpeed,
+    accuracy: typeof accuracy === 'number' ? accuracy : null,
+    heading: typeof heading === 'number' ? heading : prev?.heading ?? null,
+    timestamp: now,
+    positionTrusted:
+      typeof accuracy !== 'number' ? true : accuracy <= UNUSABLE_ACCURACY_M,
+  };
+
+  liveLocations.set(tripId, entry);
+  return entry;
+}
+
+/**
+ * Tells the driver's app to begin streaming GPS. The driver app joins
+ * `driver:${userId}` on connect; this event is what makes location sharing
+ * automatic the moment a trip becomes BOARDING — no manual tap needed.
+ */
+function broadcastStartTracking(req, trip) {
+  try {
+    const io = req.app?.get?.('io');
+    if (!io) return;
+    io.to(`driver:${trip.driverId}`).emit('start_tracking', {
+      tripId: trip.id,
+      status: trip.status,
+      reason: 'Trip is boarding — start sharing your location.',
+    });
+  } catch (err) {
+    console.error('[broadcastStartTracking]', err);
+  }
+}
+
+function broadcastStopTracking(req, tripId, driverId) {
+  try {
+    const io = req.app?.get?.('io');
+    if (!io) return;
+    io.to(`driver:${driverId}`).emit('stop_tracking', { tripId });
+  } catch (err) {
+    console.error('[broadcastStopTracking]', err);
+  }
+}
+
 // ─── State machine ────────────────────────────────────────────────────────────
 
 const VALID_TRANSITIONS = {
@@ -22,24 +106,14 @@ const VALID_TRANSITIONS = {
 
 const ALL_STATUSES = Object.keys(VALID_TRANSITIONS);
 
-// Statuses that mean a driver/van is already actively on a trip
 const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
-// Single source of truth for how a trip is hydrated everywhere it's read.
-// Every query in this file that returns a trip (or a list of trips) MUST use
-// this constant rather than writing its own include — getLiveTrips previously
-// duplicated this by hand, which is exactly the kind of copy that silently
-// falls out of sync the next time this shape changes.
 const TRIP_INCLUDE = {
   driver: { select: { id: true, name: true } },
   route:  true,
   van:    true,
 };
 
-// Maps a van's CURRENT trip status to the action a QR scan performs.
-// This is what makes a single printed sticker on the van work correctly
-// at every checkpoint — the backend derives the right transition from
-// whatever state the trip is actually in; the scanner just scans.
 const SCAN_TRANSITIONS = {
   DEPARTING: { nextStatus: 'DEPARTED',  action: 'DEPARTURE',  setField: 'actualDeparture' },
   DEPARTED:  { nextStatus: 'ARRIVING',  action: 'ARRIVAL',    setField: 'actualArrival'   },
@@ -49,7 +123,6 @@ const SCAN_TRANSITIONS = {
 
 // ─── Small helpers ─────────────────────────────────────────────────────────────
 
-/** A handled, "expected" error that should map to a 4xx response with a safe message. */
 class HttpError extends Error {
   constructor(statusCode, message) {
     super(message);
@@ -57,26 +130,11 @@ class HttpError extends Error {
   }
 }
 
-/**
- * Attaches this trip's van QR token to driver-facing trip responses, so the
- * frontend can render a scannable code (e.g. for trip completion) without a
- * separate round-trip. The token is a pure function of the van's id — no
- * extra DB lookup, and safe to regenerate on every response.
- *
- * Deliberately NOT applied to public/dispatcher-facing endpoints like
- * getLiveTrips — that route has no auth at all, and leaking this token
- * there would let anyone advance a trip's status without scanning anything.
- */
 function withVanQrToken(trip) {
   if (!trip?.van?.id) return trip;
   return { ...trip, van: { ...trip.van, qrToken: signVanQrToken(trip.van.id) } };
 }
 
-/**
- * Broadcast a real-time fleet/trip update over Socket.IO, if an io instance is
- * registered on the Express app (e.g. `app.set('io', io)` at startup).
- * Never throws — a missing socket layer should not fail the HTTP request.
- */
 function emitFleetEvent(req, event, payload) {
   try {
     const io = req.app?.get?.('io');
@@ -87,7 +145,6 @@ function emitFleetEvent(req, event, payload) {
   }
 }
 
-/** Centralised error responder: known HttpErrors get their message, everything else is generic. */
 function handleError(res, error, context, fallbackMessage = 'Internal server error.') {
   if (error instanceof HttpError) {
     return res.status(error.statusCode).json({ error: error.message });
@@ -97,14 +154,6 @@ function handleError(res, error, context, fallbackMessage = 'Internal server err
 }
 
 // ─── 0. Dispatcher: vans currently AT the terminal ────────────────────────────
-//
-// "At the terminal" means: IDLE (parked, no active trip — just completed one
-// or never started one) OR BOARDING (assigned a route, still loading
-// passengers on-site). The moment a van's trip moves to DEPARTING or beyond,
-// it has physically left, so it drops out of this list entirely.
-//
-// A van's driver is now resolved via the real Van.driver relation
-// (User.assignedVanId), not string-matching driverId to plateNumber.
 
 export const getTerminalVans = async (req, res) => {
   try {
@@ -151,6 +200,52 @@ export const getTerminalVans = async (req, res) => {
   }
 };
 
+// ─── 0b. Driver GPS ingestion (called by the driver app while BOARDING) ──────
+//
+// This is the single write path for live positions. The driver app is
+// expected to `navigator.geolocation.watchPosition(...)` and POST here as
+// soon as it receives the `start_tracking` event. We never infer a position
+// from anything else — whatever the phone reports is what the public map
+// shows, or nothing at all.
+
+export const updateDriverLocation = async (req, res) => {
+  try {
+    const { tripId, lat, lng, speed, accuracy, heading } = req.body;
+    const userId = req.user.id;
+
+    if (!tripId) {
+      return res.status(400).json({ error: 'tripId is required.' });
+    }
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ error: 'lat and lng must be numbers.' });
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'Coordinates out of range.' });
+    }
+
+    const trip = await prisma.trip.findUnique({
+      where: { id: tripId },
+      select: { id: true, driverId: true, status: true },
+    });
+
+    if (!trip) return res.status(404).json({ error: 'Trip not found.' });
+    if (trip.driverId !== userId) {
+      return res.status(403).json({ error: 'You are not the driver of this trip.' });
+    }
+    if (trip.status === 'COMPLETED' || trip.status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Trip is no longer active.' });
+    }
+
+    const entry = recordLocation(tripId, { lat, lng, speed, accuracy, heading });
+
+    // Fan out to everyone on the public map in real time.
+    emitFleetEvent(req, 'van_moved', { tripId, ...entry });
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return handleError(res, error, 'updateDriverLocation', 'Failed to record location.');
+  }
+};
 
 // ─── 1. Update trip status ────────────────────────────────────────────────────
 
@@ -182,7 +277,6 @@ export const updateTripStatus = async (req, res) => {
         data: { tripId: id, status: newStatus, recordedById: userId },
       });
 
-      // If the trip is over, release the van so it can be dispatched again
       if (newStatus === 'COMPLETED' || newStatus === 'CANCELLED') {
         await tx.van.update({
           where: { id: trip.vanId },
@@ -199,6 +293,20 @@ export const updateTripStatus = async (req, res) => {
       trip:   updatedTrip,
     });
 
+    // Auto-start location sharing the moment a trip begins boarding — the
+    // driver's app listens for this and turns on `watchPosition` itself.
+    if (updatedTrip.status === 'BOARDING' || updatedTrip.status === 'DEPARTING') {
+      broadcastStartTracking(req, updatedTrip);
+    }
+
+    // Trip is over — tell the driver's app to stop streaming and drop the
+    // stale fix so it can't leak into the next trip's map view.
+    if (updatedTrip.status === 'COMPLETED' || updatedTrip.status === 'CANCELLED') {
+      clearTripLocation(updatedTrip.id);
+      broadcastStopTracking(req, updatedTrip.id, updatedTrip.driverId);
+      emitFleetEvent(req, 'trip_removed', { tripId: updatedTrip.id });
+    }
+
     return res.status(200).json({ message: 'Status updated', trip: withVanQrToken(updatedTrip) });
   } catch (error) {
     return handleError(res, error, 'updateTripStatus', 'Failed to update trip status.');
@@ -206,14 +314,6 @@ export const updateTripStatus = async (req, res) => {
 };
 
 // ─── 2. QR scan handler ───────────────────────────────────────────────────────
-//
-// Scans a signed, permanent van QR token (issued once at van creation —
-// see driver.controller.js's registerDriver, which now creates the van).
-// No tripId or action is ever trusted from the client: the token only
-// identifies the van, and the backend looks up that van's CURRENT active
-// trip to decide what a scan should do. This means one printed sticker on
-// the van works correctly at every checkpoint of every future trip, and a
-// scan can never be used to force an arbitrary status transition.
 
 export const handleQrScan = async (req, res) => {
   try {
@@ -271,8 +371,6 @@ export const handleQrScan = async (req, res) => {
         data: { tripId: trip.id, vanId, scannedById: userId, action: transition.action },
       });
 
-      // Once the trip is fully wrapped up, release the van so it can be
-      // assigned to a new trip again.
       if (transition.nextStatus === 'COMPLETED') {
         await tx.van.update({ where: { id: vanId }, data: { status: 'IDLE' } });
       }
@@ -285,6 +383,12 @@ export const handleQrScan = async (req, res) => {
       status: result.trip.status,
       trip:   result.trip,
     });
+
+    if (result.trip.status === 'COMPLETED') {
+      clearTripLocation(result.trip.id);
+      broadcastStopTracking(req, result.trip.id, result.trip.driverId);
+      emitFleetEvent(req, 'trip_removed', { tripId: result.trip.id });
+    }
 
     return res.status(200).json({
       message: `${result.trip.van?.plateNumber ?? 'Van'} → ${result.trip.status}`,
@@ -308,9 +412,7 @@ export const getMyTrips = async (req, res) => {
         status: { notIn: ['COMPLETED', 'CANCELLED'] },
       },
       include: TRIP_INCLUDE,
-      orderBy: {
-        id: 'desc',
-      },
+      orderBy: { id: 'desc' },
     });
 
     return res.status(200).json(trips.map(withVanQrToken));
@@ -320,12 +422,6 @@ export const getMyTrips = async (req, res) => {
 };
 
 // ─── 4. Driver self-starts their own trip ────────────────────────────────────
-//
-// The driver's van is now resolved via the real assignedVan relation
-// instead of matching driverId text against Van.plateNumber — a typo or
-// formatting drift can no longer silently orphan a driver from their van.
-// The van itself is created once, at registration time (driver.controller.js),
-// always with status 'IDLE' — this function is what first moves it to 'ON_TRIP'.
 
 export const selfStartTrip = async (req, res) => {
   try {
@@ -416,6 +512,9 @@ export const selfStartTrip = async (req, res) => {
       trip:   newTrip,
     });
 
+    // Boarding starts immediately — auto-start the driver's GPS stream now.
+    broadcastStartTracking(req, newTrip);
+
     return res.status(201).json(withVanQrToken(newTrip));
   } catch (error) {
     return handleError(res, error, 'selfStartTrip', 'An unexpected error occurred while starting your trip. Please try again.');
@@ -448,8 +547,6 @@ export const createTrip = async (req, res) => {
     }
 
     const trip = await prisma.$transaction(async (tx) => {
-      // Atomically claim the van: only succeeds if it's still IDLE, closing
-      // the race window where two dispatches target the same van at once.
       const vanClaim = await tx.van.updateMany({
         where: { id: vanId, status: 'IDLE' },
         data:  { status: 'ON_TRIP' },
@@ -485,6 +582,9 @@ export const createTrip = async (req, res) => {
       trip,
     });
 
+    // Dispatcher just created a BOARDING trip — auto-start the driver's GPS.
+    broadcastStartTracking(req, trip);
+
     return res.status(201).json({ message: 'Trip successfully dispatched!', trip });
   } catch (error) {
     return handleError(res, error, 'createTrip', 'Failed to dispatch trip.');
@@ -492,24 +592,29 @@ export const createTrip = async (req, res) => {
 };
 
 // ─── 7. Fetch all active live trips (Public & Dispatcher) ─────────────────────
-//
-// Now reuses TRIP_INCLUDE instead of a hand-duplicated include object — the
-// two happened to be identical, but there was nothing enforcing that, and a
-// future edit to one without the other would have silently produced a
-// mismatch between this endpoint and every other trip-returning one in the
-// file (e.g. driver/dispatcher trips missing a field the public map expects).
 
 export const getLiveTrips = async (req, res) => {
   try {
     const activeTrips = await prisma.trip.findMany({
       where: {
-        status: { notIn: ['COMPLETED', 'CANCELLED'] }
+        status: { notIn: ['COMPLETED', 'CANCELLED'] },
       },
       include: TRIP_INCLUDE,
-      orderBy: { id: 'desc' }
+      orderBy: { id: 'desc' },
     });
 
-    return res.status(200).json(activeTrips);
+    // Attach the last known phone fix (if any) so polling clients can still
+    // plot a marker without waiting for the next socket push.
+    const withLive = activeTrips.map((trip) => {
+      const loc = liveLocations.get(trip.id);
+      const isStale = loc && Date.now() - loc.timestamp > LOCATION_STALE_MS;
+      return {
+        ...trip,
+        liveLocation: loc && !isStale ? loc : null,
+      };
+    });
+
+    return res.status(200).json(withLive);
   } catch (error) {
     console.error('[getLiveTrips]', error);
     return res.status(500).json({ error: 'Failed to fetch live dispatch data.' });
