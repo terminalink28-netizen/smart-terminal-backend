@@ -27,7 +27,15 @@ export function initializeSockets(httpServer) {
     socket.on('subscribe_to_map', () => {
       socket.join('map');
       socket.emit('initial_locations', getLiveLocationsSnapshot());
-    });
+    // Relays a driver's seat count to everyone watching the public map.
+// Previously nothing listened for this event at all — the driver's
+// emit went out into the void, which is why seat counts never updated
+// on the public tracking page no matter how often the driver tapped +/-.
+socket.on('seat_update', (payload = {}) => {
+  const { tripId, availableSeats, totalSeats } = payload;
+  if (!tripId || typeof availableSeats !== 'number') return;
+  io.to('map').emit('seat_update_broadcast', { tripId, availableSeats, totalSeats });
+});
 
     // ── Driver apps ───────────────────────────────────────────────────────
     // The driver's phone joins `driver:<userId>` after login so the backend
