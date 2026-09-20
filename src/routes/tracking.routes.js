@@ -9,6 +9,6 @@ const router = express.Router();
 router.get('/live', getLiveTrips);
 
 // Driver GPS ingestion alias (if your driver app prefers /api/tracking/location).
-router.post('/location', requireAuth, requireRole('DRIVER'), updateDriverLocation);
+router.post('/location', requireAuth, requireRoles('DRIVER'), updateDriverLocation);
 
 export default router;
