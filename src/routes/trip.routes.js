@@ -1,27 +1,33 @@
 // src/routes/trip.routes.js
 import express from 'express';
-import * as tripController from '../controllers/trip.controller.js';
+import {
+  getLiveTrips,
+  getDispatchResources,
+  createTrip,
+  getMyTrips,
+  selfStartTrip,
+  updateTripStatus,
+  handleQrScan,
+  getTerminalVans,
+} from '../controllers/trip.controller.js';
 import { requireAuth, requireRoles } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
 
-// ─── Public: live trips + last known GPS fix ────────────────────────────────
-router.get('/live', tripController.getLiveTrips);
+// ─── Public Routes ───
+router.get('/live', getLiveTrips);
 
-// ─── Driver: submit a GPS fix (called continuously by the driver app) ───────
-router.post(
-  '/location',
-  requireAuth,
-  requireRole('DRIVER'),
-  tripController.updateDriverLocation,
-);
+// ─── Dispatcher & Admin Routes ───
+router.get('/dispatch-resources', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), getDispatchResources);
+router.post('/dispatch', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), createTrip);
+router.get('/terminal', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), getTerminalVans);
 
-// ─── Existing trip endpoints ────────────────────────────────────────────────
-router.post('/',            requireAuth, requireRole('DISPATCHER'), tripController.createTrip);
-router.post('/self-start',  requireAuth, requireRole('DRIVER'),     tripController.selfStartTrip);
-router.post('/qr-scan',     requireAuth, requireRole('DRIVER'),     tripController.handleQrScan);
-router.get('/mine',         requireAuth, requireRole('DRIVER'),     tripController.getMyTrips);
-router.get('/terminal-vans',requireAuth, requireRole('DISPATCHER'), tripController.getTerminalVans);
-router.patch('/:id/status', requireAuth, tripController.updateTripStatus);
+// ─── Driver Routes ───
+router.get('/my-trips', requireAuth, requireRoles(['DRIVER']), getMyTrips);
+router.post('/self-start', requireAuth, requireRoles(['DRIVER']), selfStartTrip);
+
+// ─── Shared Status Updates ───
+router.patch('/:id/status', requireAuth, updateTripStatus);
+router.post('/qr-scan', requireAuth, handleQrScan);
 
 export default router;
