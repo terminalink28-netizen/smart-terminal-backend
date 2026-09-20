@@ -7,6 +7,7 @@ import {
   getMyTrips,
   selfStartTrip,
   updateTripStatus,
+  updateTripSeats,
   handleQrScan,
   getTerminalVans,
   updateDriverLocation,
@@ -27,6 +28,9 @@ router.get('/terminal', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), getT
 router.get('/my-trips', requireAuth, requireRoles(['DRIVER']), getMyTrips);
 router.post('/self-start', requireAuth, requireRoles(['DRIVER']), selfStartTrip);
 router.post('/location', requireAuth, requireRoles(['DRIVER']), updateDriverLocation);
+
+// ─── Driver: persist seat counts on the active trip ───
+router.patch('/:id/seats', requireAuth, requireRoles(['DRIVER']), updateTripSeats);
 
 // ─── Shared Status Updates ───
 router.patch('/:id/status', requireAuth, updateTripStatus);
