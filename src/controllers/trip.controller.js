@@ -30,7 +30,7 @@ const VALID_TRANSITIONS = {
 const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
 const TRIP_INCLUDE = {
-  driver: { select: { id: true, name: true, contactNumber: true } },
+  driver: { select: { id: true, name: true, contactNumber: true, contactNumbers: true } },
   route:  true,
   van:    true,
 };
