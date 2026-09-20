@@ -9,6 +9,7 @@ import {
   updateTripStatus,
   handleQrScan,
   getTerminalVans,
+  updateDriverLocation,
 } from '../controllers/trip.controller.js';
 import { requireAuth, requireRoles } from '../middleware/auth.middleware.js';
 
@@ -25,6 +26,7 @@ router.get('/terminal', requireAuth, requireRoles(['ADMIN', 'DISPATCHER']), getT
 // ─── Driver Routes ───
 router.get('/my-trips', requireAuth, requireRoles(['DRIVER']), getMyTrips);
 router.post('/self-start', requireAuth, requireRoles(['DRIVER']), selfStartTrip);
+router.post('/location', requireAuth, requireRoles(['DRIVER']), updateDriverLocation);
 
 // ─── Shared Status Updates ───
 router.patch('/:id/status', requireAuth, updateTripStatus);
