@@ -4,9 +4,11 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 // --- ENUMS ---
+
 enum Role {
   ADMIN
   DISPATCHER
@@ -36,86 +38,123 @@ enum ApprovalStatus {
   REJECTED
 }
 
+// --- MODELS ---
+
 model User {
-  id            String   @id @default(uuid())
+  id            String         @id @default(uuid())
   role          Role
   name          String
-  email         String?  @unique
-  driverId      String?  @unique
+  email         String?        @unique
+  driverId      String?        @unique
   passwordHash  String?
   pinHash       String?
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
 
-  // NEW
+  // Driver contact details.
+  //   contactNumber  — kept for backward compatibility with older clients
+  //                    and public/dashboard views that still read the
+  //                    singular field. Always kept in sync with
+  //                    `contactNumbers[0]` on save.
+  //   contactNumbers — the source of truth for the multi-number UI. A
+  //                    driver can maintain up to 5 numbers here.
   contactNumber   String?
+  contactNumbers  String[]       @default([])
+
+  // Driver onboarding / verification
   licensePhotoUrl String?
   approvalStatus  ApprovalStatus @default(APPROVED) // admin/dispatcher accounts skip review; self-registered drivers start PENDING
   rejectionReason String?
 
-  assignedVanId String?  @unique
-  assignedVan   Van?     @relation("DriverVan", fields: [assignedVanId], references: [id])
+  // Van assignment (one driver ↔ at most one van)
+  assignedVanId String? @unique
+  assignedVan   Van?    @relation("DriverVan", fields: [assignedVanId], references: [id])
 
-  tripsAsDriver     Trip[]              @relation("TripDriver")
-  statusUpdates     TripStatusHistory[] @relation("RecordedBy")
-  qrScans           QrScanLog[]         @relation("ScannedBy")
+  // Relations
+  tripsAsDriver Trip[]              @relation("TripDriver")
+  statusUpdates TripStatusHistory[] @relation("RecordedBy")
+  qrScans       QrScanLog[]         @relation("ScannedBy")
+
+  @@index([role, isActive])
+  @@index([approvalStatus])
 }
 
 model Van {
-  id            String    @id @default(uuid())
-  plateNumber   String    @unique
-  capacity      Int
-  status        VanStatus @default(IDLE)
+  id          String    @id @default(uuid())
+  plateNumber String    @unique
+  capacity    Int
+  status      VanStatus @default(IDLE)
 
-  // NEW — reverse side of the driver relation
-  driver        User?     @relation("DriverVan")
+  // Reverse side of the driver relation — a van has at most one assigned driver.
+  driver      User?     @relation("DriverVan")
 
   // Relations
-  trips         Trip[]
-  qrScans       QrScanLog[]
+  trips       Trip[]
+  qrScans     QrScanLog[]
+
+  @@index([status])
 }
 
 model Route {
-  id            String @id @default(uuid())
-  name          String
-  origin        String
-  destination   String
-  waypoints     Json?  // Store path coordinates as JSON array
-  
+  id          String @id @default(uuid())
+  name        String
+  origin      String
+  destination String
+  waypoints   Json?  // Store path coordinates as JSON array
+
   // Relations
-  trips         Trip[]
+  trips       Trip[]
+
+  @@index([name])
 }
 
 model Trip {
-  id               String     @id @default(uuid())
-  routeId          String
-  vanId            String
-  driverId         String
-  status           TripStatus @default(SCHEDULED)
-  scheduledTime    DateTime
-  actualDeparture  DateTime?
-  actualArrival    DateTime?
-  
+  id              String     @id @default(uuid())
+  routeId         String
+  vanId           String
+  driverId        String
+  status          TripStatus @default(SCHEDULED)
+  scheduledTime   DateTime
+  actualDeparture DateTime?
+  actualArrival   DateTime?
+
+  // Seat availability — persisted on the trip (not the van) so the count
+  // travels through every phase of THIS trip and survives page reloads,
+  // logout/login, and status changes. Seeded from `van.capacity` when the
+  // trip is created, then updated by the driver's +/- controls.
+  availableSeats  Int?
+  totalSeats      Int?
+
   // Relations
-  route            Route               @relation(fields: [routeId], references: [id])
-  van              Van                 @relation(fields: [vanId], references: [id])
-  driver           User                @relation("TripDriver", fields: [driverId], references: [id])
-  statusHistory    TripStatusHistory[]
-  gpsTelemetry     GpsTelemetry[]
-  qrScans          QrScanLog[]
+  route         Route               @relation(fields: [routeId],    references: [id])
+  van           Van                 @relation(fields: [vanId],      references: [id])
+  driver        User                @relation("TripDriver", fields: [driverId], references: [id])
+  statusHistory TripStatusHistory[]
+  gpsTelemetry  GpsTelemetry[]
+  qrScans       QrScanLog[]
+
+  // Hot query paths:
+  //  - `status` alone backs the public `/trips/live` filter.
+  //  - `[driverId, status]` backs the driver's `/trips/my-trips` lookup.
+  //  - `[vanId, status]`   backs the QR-scan "active trip for this van" lookup.
+  @@index([status])
+  @@index([driverId, status])
+  @@index([vanId, status])
 }
 
 model TripStatusHistory {
-  id               String     @id @default(uuid())
-  tripId           String
-  status           TripStatus
-  recordedById     String?
-  timestamp        DateTime   @default(now())
+  id           String     @id @default(uuid())
+  tripId       String
+  status       TripStatus
+  recordedById String?
+  timestamp    DateTime   @default(now())
 
   // Relations
-  trip             Trip       @relation(fields: [tripId], references: [id])
-  recordedBy       User?      @relation("RecordedBy", fields: [recordedById], references: [id])
+  trip       Trip  @relation(fields: [tripId],       references: [id])
+  recordedBy User? @relation("RecordedBy", fields: [recordedById], references: [id])
+
+  @@index([tripId, timestamp])
 }
 
 model GpsTelemetry {
@@ -124,10 +163,17 @@ model GpsTelemetry {
   lat       Float
   lng       Float
   speed     Float?
+  // Optional — populated when the driver's phone reports them, so a
+  // future backfill or analytics job can reconstruct fix quality.
+  accuracy  Float?
+  heading   Float?
   timestamp DateTime @default(now())
 
   // Relations
   trip      Trip     @relation(fields: [tripId], references: [id])
+
+  // Time-series access pattern: "give me the recent history for trip X".
+  @@index([tripId, timestamp])
 }
 
 model QrScanLog {
@@ -135,13 +181,16 @@ model QrScanLog {
   tripId      String
   vanId       String
   scannedById String
-  action      String   // "ARRIVAL" or "DEPARTURE"
+  action      String   // "DEPARTURE" | "ARRIVAL" | "COMPLETION"
   timestamp   DateTime @default(now())
 
   // Relations
-  trip        Trip     @relation(fields: [tripId], references: [id])
-  van         Van      @relation(fields: [vanId], references: [id])
-  scannedBy   User     @relation("ScannedBy", fields: [scannedById], references: [id])
+  trip      Trip @relation(fields: [tripId],      references: [id])
+  van       Van  @relation(fields: [vanId],       references: [id])
+  scannedBy User @relation("ScannedBy", fields: [scannedById], references: [id])
+
+  @@index([tripId, timestamp])
+  @@index([vanId])
 }
 
 model AuditLog {
@@ -153,4 +202,7 @@ model AuditLog {
   target     String?
   details    String?
   timestamp  DateTime @default(now())
+
+  @@index([timestamp])
+  @@index([actorId])
 }
