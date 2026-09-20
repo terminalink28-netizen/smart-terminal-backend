@@ -74,12 +74,6 @@ function handleError(res, error, context, fallbackMessage = 'Internal server err
   return res.status(500).json({ error: fallbackMessage });
 }
 
-/**
- * Tells the driver's phone to begin streaming GPS. Fires the instant a trip
- * enters BOARDING (self-start, dispatcher create, or status change). The
- * driver app listens for `start_tracking` and turns on watchPosition itself
- * — no manual tap needed.
- */
 function broadcastStartTracking(trip) {
   try {
     const io = getIo();
@@ -112,7 +106,13 @@ export const getTerminalVans = async (req, res) => {
     const [idleVans, boardingTrips] = await Promise.all([
       prisma.van.findMany({
         where: { status: 'IDLE' },
-        include: { driver: { select: { id: true, name: true } } },
+        // contactNumber + contactNumbers added for parity with boarding
+        // entries — dispatchers can call an idle driver the same way.
+        include: {
+          driver: {
+            select: { id: true, name: true, contactNumber: true, contactNumbers: true },
+          },
+        },
         orderBy: { plateNumber: 'asc' },
       }),
       prisma.trip.findMany({
@@ -143,6 +143,8 @@ export const getTerminalVans = async (req, res) => {
         origin: trip.route?.origin ?? null,
         destination: trip.route?.destination ?? null,
         scheduledTime: trip.scheduledTime,
+        availableSeats: trip.availableSeats,
+        totalSeats: trip.totalSeats,
       },
     }));
 
@@ -183,7 +185,6 @@ export const updateDriverLocation = async (req, res) => {
 
     const entry = recordLocation(tripId, { lat, lng, speed, accuracy, heading });
 
-    // Fan out to the public map room only.
     try {
       const io = getIo();
       io?.to('map').emit('van_moved', { tripId, ...entry });
@@ -194,6 +195,67 @@ export const updateDriverLocation = async (req, res) => {
     return res.status(200).json({ ok: true, entry });
   } catch (error) {
     return handleError(res, error, 'updateDriverLocation', 'Failed to record location.');
+  }
+};
+
+// ─── 0c. Driver: persist seat counts on the trip ─────────────────────────────
+//
+// Called by the driver app whenever the +/- seat controls change. The
+// count lives on the Trip row, so it carries through every phase change
+// and survives logout/login until the trip ends.
+
+export const updateTripSeats = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { availableSeats, totalSeats } = req.body;
+    const userId = req.user?.id;
+
+    if (!userId) return res.status(401).json({ error: 'Authentication required.' });
+    if (typeof availableSeats !== 'number' || typeof totalSeats !== 'number') {
+      return res.status(400).json({ error: 'availableSeats and totalSeats must be numbers.' });
+    }
+    if (totalSeats < 1 || totalSeats > 100) {
+      return res.status(400).json({ error: 'totalSeats must be between 1 and 100.' });
+    }
+    if (availableSeats < 0 || availableSeats > totalSeats) {
+      return res.status(400).json({ error: 'availableSeats must be between 0 and totalSeats.' });
+    }
+
+    const trip = await prisma.trip.findUnique({
+      where: { id },
+      select: { id: true, driverId: true, status: true },
+    });
+
+    if (!trip) return res.status(404).json({ error: 'Trip not found.' });
+    if (trip.driverId !== userId) {
+      return res.status(403).json({ error: 'You are not the driver of this trip.' });
+    }
+    if (trip.status === 'COMPLETED' || trip.status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Trip is no longer active.' });
+    }
+
+    await prisma.trip.update({
+      where: { id },
+      data: {
+        availableSeats: Math.round(availableSeats),
+        totalSeats:     Math.round(totalSeats),
+      },
+    });
+
+    // Broadcast so the public map and dispatcher see the new count live.
+    emitFleetEvent('seat_update_broadcast', {
+      tripId: id,
+      availableSeats: Math.round(availableSeats),
+      totalSeats: Math.round(totalSeats),
+    });
+
+    return res.status(200).json({
+      ok: true,
+      availableSeats: Math.round(availableSeats),
+      totalSeats: Math.round(totalSeats),
+    });
+  } catch (error) {
+    return handleError(res, error, 'updateTripSeats', 'Failed to save seat counts.');
   }
 };
 
@@ -243,7 +305,6 @@ export const updateTripStatus = async (req, res) => {
       trip:   updatedTrip,
     });
 
-    // Auto-start GPS the moment boarding begins — no manual tap needed.
     if (updatedTrip.status === 'BOARDING' || updatedTrip.status === 'DEPARTING') {
       broadcastStartTracking(updatedTrip);
     }
@@ -431,6 +492,10 @@ export const selfStartTrip = async (req, res) => {
           driverId: driverUserId,
           status: 'BOARDING',
           scheduledTime: new Date(),
+          // Seed from the van so the driver sees a sensible number even
+          // before they touch the seat controls.
+          availableSeats: van.capacity,
+          totalSeats:     van.capacity,
         },
         include: TRIP_INCLUDE,
       });
@@ -443,7 +508,6 @@ export const selfStartTrip = async (req, res) => {
       trip:   newTrip,
     });
 
-    // Boarding starts immediately — tell the driver's phone to begin GPS.
     broadcastStartTracking(newTrip);
 
     return res.status(201).json(withVanQrToken(newTrip));
@@ -498,8 +562,18 @@ export const createTrip = async (req, res) => {
       const route = await tx.route.findUnique({ where: { id: routeId } });
       if (!route) throw new HttpError(400, 'Dispatch failed: route not found.');
 
+      const van = await tx.van.findUnique({ where: { id: vanId } });
+
       return tx.trip.create({
-        data: { routeId, vanId, driverId, status: 'BOARDING', scheduledTime: new Date() },
+        data: {
+          routeId,
+          vanId,
+          driverId,
+          status: 'BOARDING',
+          scheduledTime: new Date(),
+          availableSeats: van?.capacity ?? 14,
+          totalSeats:     van?.capacity ?? 14,
+        },
         include: TRIP_INCLUDE,
       });
     });
@@ -520,10 +594,6 @@ export const createTrip = async (req, res) => {
 };
 
 // ─── 7. Public live trips (WITH last known GPS fix) ───────────────────────────
-//
-// This is what the public tracking page fetches. Each trip carries a
-// `liveLocation` field with the freshest phone fix we have, so a cold page
-// load plots markers immediately — no need to wait for the next socket push.
 
 export const getLiveTrips = async (req, res) => {
   try {
