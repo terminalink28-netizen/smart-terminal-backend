@@ -1,7 +1,7 @@
 // src/routes/trip.routes.js
 import express from 'express';
 import * as tripController from '../controllers/trip.controller.js';
-import { requireAuth, requireRole } from '../middleware/auth.js';
+import { requireAuth, requireRoles } from '../middleware/auth.middleware.js';
 
 const router = express.Router();
 
