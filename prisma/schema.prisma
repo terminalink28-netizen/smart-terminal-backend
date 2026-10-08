@@ -21,14 +21,21 @@ enum VanStatus {
 }
 
 enum TripStatus {
-  SCHEDULED
+  SCHEDULED // unused now, kept for compatibility
   BOARDING
   DEPARTING
   DEPARTED
   ARRIVING
+  QUEUED // checked in at the terminal, waiting for its cooperative's boarding slot
   COMPLETED
   DELAYED
   CANCELLED
+}
+
+// A trip is a full round trip made of two legs.
+enum TripDirection {
+  OUTBOUND // municipality -> terminal
+  RETURN // terminal -> municipality
 }
 
 enum ApprovalStatus {
@@ -40,19 +47,19 @@ enum ApprovalStatus {
 // --- MODELS ---
 
 model User {
-  id            String         @id @default(uuid())
-  role          Role
-  name          String
-  email         String?        @unique
-  driverId      String?        @unique
-  passwordHash  String?
-  pinHash       String?
-  isActive      Boolean        @default(true)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  id           String   @id @default(uuid())
+  role         Role
+  name         String
+  email        String?  @unique
+  driverId     String?  @unique
+  passwordHash String?
+  pinHash      String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  contactNumber   String?
-  contactNumbers  String[]       @default([])
+  contactNumber  String?
+  contactNumbers String[] @default([])
 
   licensePhotoUrl String?
   approvalStatus  ApprovalStatus @default(APPROVED)
@@ -69,18 +76,31 @@ model User {
   @@index([approvalStatus])
 }
 
+// A transport cooperative. Each cooperative has its own single boarding
+// slot at the terminal, so vans only queue behind vans of the SAME cooperative.
+model Cooperative {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  vans Van[]
+}
+
 model Van {
-  id          String    @id @default(uuid())
-  plateNumber String    @unique
-  capacity    Int
-  status      VanStatus @default(IDLE)
+  id            String    @id @default(uuid())
+  plateNumber   String    @unique
+  capacity      Int
+  status        VanStatus @default(IDLE)
+  cooperativeId String?
 
-  driver      User?     @relation("DriverVan")
+  cooperative Cooperative? @relation(fields: [cooperativeId], references: [id])
+  driver      User?        @relation("DriverVan")
 
-  trips       Trip[]
-  qrScans     QrScanLog[]
+  trips   Trip[]
+  qrScans QrScanLog[]
 
   @@index([status])
+  @@index([cooperativeId])
 }
 
 model Route {
@@ -90,32 +110,34 @@ model Route {
   destination String
   waypoints   Json?
 
-  trips       Trip[]
+  trips Trip[]
 
   @@index([name])
 }
 
 model Trip {
-  id              String     @id @default(uuid())
+  id              String        @id @default(uuid())
   routeId         String
   vanId           String
   driverId        String
-  status          TripStatus @default(SCHEDULED)
+  status          TripStatus    @default(SCHEDULED)
+  direction       TripDirection @default(OUTBOUND)
   scheduledTime   DateTime
   actualDeparture DateTime?
   actualArrival   DateTime?
 
-  availableSeats  Int?
-  totalSeats      Int?
+  availableSeats Int?
+  totalSeats     Int?
 
-  route         Route               @relation(fields: [routeId],    references: [id])
-  van           Van                 @relation(fields: [vanId],      references: [id])
+  route         Route               @relation(fields: [routeId], references: [id])
+  van           Van                 @relation(fields: [vanId], references: [id])
   driver        User                @relation("TripDriver", fields: [driverId], references: [id])
   statusHistory TripStatusHistory[]
   gpsTelemetry  GpsTelemetry[]
   qrScans       QrScanLog[]
 
   @@index([status])
+  @@index([status, direction])
   @@index([driverId, status])
   @@index([vanId, status])
 }
@@ -127,7 +149,7 @@ model TripStatusHistory {
   recordedById String?
   timestamp    DateTime   @default(now())
 
-  trip       Trip  @relation(fields: [tripId],       references: [id])
+  trip       Trip  @relation(fields: [tripId], references: [id])
   recordedBy User? @relation("RecordedBy", fields: [recordedById], references: [id])
 
   @@index([tripId, timestamp])
@@ -143,7 +165,7 @@ model GpsTelemetry {
   heading   Float?
   timestamp DateTime @default(now())
 
-  trip      Trip     @relation(fields: [tripId], references: [id])
+  trip Trip @relation(fields: [tripId], references: [id])
 
   @@index([tripId, timestamp])
 }
@@ -156,8 +178,8 @@ model QrScanLog {
   action      String
   timestamp   DateTime @default(now())
 
-  trip      Trip @relation(fields: [tripId],      references: [id])
-  van       Van  @relation(fields: [vanId],       references: [id])
+  trip      Trip @relation(fields: [tripId], references: [id])
+  van       Van  @relation(fields: [vanId], references: [id])
   scannedBy User @relation("ScannedBy", fields: [scannedById], references: [id])
 
   @@index([tripId, timestamp])
