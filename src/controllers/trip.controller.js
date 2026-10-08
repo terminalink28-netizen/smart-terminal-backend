@@ -15,31 +15,42 @@ const adapter = new PrismaPg(pool);
 const prisma  = new PrismaClient({ adapter });
 
 // ─── State machine ────────────────────────────────────────────────────────────
+//
+// A trip is a full round trip, made of two legs tracked by `direction`:
+//   OUTBOUND — municipality → terminal (driver self-starts here)
+//   RETURN   — terminal → municipality (entered only via the dispatcher's
+//              QR check-in at the terminal, or via queue promotion)
+//
+// Both legs share the same BOARDING → DEPARTING → DEPARTED → ARRIVING
+// shape, driven by the driver's own buttons. The one exception: ARRIVING
+// while OUTBOUND can only become QUEUED/BOARDING(RETURN) via a dispatcher
+// QR scan (see handleQrScan) — never straight to COMPLETED. ARRIVING
+// while RETURN is finished by the driver's own "Finish Trip" button (a
+// normal call into updateTripStatus), no scan needed.
+//
+// Terminal boarding is a PER-COOPERATIVE resource: each cooperative has
+// its own single boarding slot, so a van only queues behind other vans
+// from the SAME cooperative, never behind vans from a different one.
 
 const VALID_TRANSITIONS = {
-  SCHEDULED:  ['BOARDING', 'CANCELLED', 'DELAYED'],
-  BOARDING:   ['DEPARTING', 'DELAYED'],
+  BOARDING:   ['DEPARTING', 'DELAYED', 'CANCELLED'],
   DEPARTING:  ['DEPARTED', 'DELAYED'],
   DEPARTED:   ['ARRIVING', 'DELAYED'],
-  ARRIVING:   ['COMPLETED', 'DELAYED'],
+  ARRIVING:   ['DELAYED', 'COMPLETED'], // COMPLETED gated by direction, see below
+  QUEUED:     [], // only ever changed internally (promotion), never by API caller
   DELAYED:    ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'],
   COMPLETED:  [],
   CANCELLED:  [],
 };
 
-const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+// Anything that isn't finished yet — used to block a driver from starting
+// a second round trip while one is still in progress.
+const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'QUEUED', 'DELAYED'];
 
 const TRIP_INCLUDE = {
   driver: { select: { id: true, name: true, contactNumber: true, contactNumbers: true } },
   route:  true,
-  van:    true,
-};
-
-const SCAN_TRANSITIONS = {
-  DEPARTING: { nextStatus: 'DEPARTED',  action: 'DEPARTURE',  setField: 'actualDeparture' },
-  DEPARTED:  { nextStatus: 'ARRIVING',  action: 'ARRIVAL',    setField: 'actualArrival'   },
-  DELAYED:   { nextStatus: 'ARRIVING',  action: 'ARRIVAL',    setField: 'actualArrival'   },
-  ARRIVING:  { nextStatus: 'COMPLETED', action: 'COMPLETION', setField: null              },
+  van:    { include: { cooperative: true } },
 };
 
 // ─── Small helpers ─────────────────────────────────────────────────────────────
@@ -83,7 +94,6 @@ function broadcastStartTracking(trip) {
       status: trip.status,
       reason: 'Trip is boarding — start sharing your location.',
     });
-    console.log(`[start_tracking] driver=${trip.driverId} trip=${trip.id}`);
   } catch (err) {
     console.error('[broadcastStartTracking]', err);
   }
@@ -99,56 +109,135 @@ function broadcastStopTracking(tripId, driverId) {
   }
 }
 
-// ─── 0. Dispatcher: vans currently AT the terminal ────────────────────────────
+// Promotes the longest-waiting QUEUED (RETURN-leg) trip for ONE cooperative
+// into BOARDING once that cooperative's terminal boarding slot frees up.
+// `cooperativeId` may be null — vans with no cooperative assigned share one
+// "unassigned" slot together, scoped the same way as a real cooperative.
+async function promoteNextQueuedTrip(tx, cooperativeId) {
+  const stillBoardingAtTerminal = await tx.trip.findFirst({
+    where: { status: 'BOARDING', direction: 'RETURN', van: { cooperativeId } },
+  });
+  if (stillBoardingAtTerminal) return null;
+
+  const next = await tx.trip.findFirst({
+    where: { status: 'QUEUED', direction: 'RETURN', van: { cooperativeId } },
+    orderBy: { actualArrival: 'asc' }, // first checked in = first in line
+  });
+  if (!next) return null;
+
+  const promoted = await tx.trip.update({
+    where: { id: next.id },
+    data: { status: 'BOARDING' },
+    include: TRIP_INCLUDE,
+  });
+
+  await tx.tripStatusHistory.create({
+    data: { tripId: next.id, status: 'BOARDING' },
+  });
+
+  return promoted;
+}
+
+// ─── 0. Dispatcher: vans currently AT the terminal, grouped by cooperative ───
 
 export const getTerminalVans = async (req, res) => {
   try {
-    const [idleVans, boardingTrips] = await Promise.all([
+    const [idleVans, awaitingCheckIn, boardingAtTerminal, queuedAtTerminal, cooperatives] = await Promise.all([
       prisma.van.findMany({
         where: { status: 'IDLE' },
-        // contactNumber + contactNumbers added for parity with boarding
-        // entries — dispatchers can call an idle driver the same way.
         include: {
-          driver: {
-            select: { id: true, name: true, contactNumber: true, contactNumbers: true },
-          },
+          driver: { select: { id: true, name: true, contactNumber: true, contactNumbers: true } },
+          cooperative: true,
         },
         orderBy: { plateNumber: 'asc' },
       }),
       prisma.trip.findMany({
-        where: { status: 'BOARDING' },
+        where: { status: 'ARRIVING', direction: 'OUTBOUND' },
         include: TRIP_INCLUDE,
         orderBy: { id: 'desc' },
       }),
+      prisma.trip.findMany({
+        where: { status: 'BOARDING', direction: 'RETURN' },
+        include: TRIP_INCLUDE,
+        orderBy: { id: 'desc' },
+      }),
+      prisma.trip.findMany({
+        where: { status: 'QUEUED', direction: 'RETURN' },
+        include: TRIP_INCLUDE,
+        orderBy: { actualArrival: 'asc' },
+      }),
+      prisma.cooperative.findMany({ orderBy: { name: 'asc' } }),
     ]);
 
-    const idleEntries = idleVans.map((van) => ({
-      vanId: van.id,
-      plateNumber: van.plateNumber,
-      capacity: van.capacity,
-      terminalStatus: 'IDLE',
-      driver: van.driver ?? null,
-      trip: null,
-    }));
+    const groups = new Map();
+    const ensureGroup = (id, name) => {
+      const key = id ?? 'unassigned';
+      if (!groups.has(key)) {
+        groups.set(key, {
+          cooperativeId: id ?? null,
+          cooperativeName: name,
+          awaitingScan: [],
+          boarding: [],
+          queued: [],
+          idle: [],
+        });
+      }
+      return groups.get(key);
+    };
 
-    const boardingEntries = boardingTrips.map((trip) => ({
+    for (const c of cooperatives) ensureGroup(c.id, c.name);
+    ensureGroup(null, 'Unassigned');
+
+    const toEntry = (trip) => ({
       vanId: trip.van.id,
       plateNumber: trip.van.plateNumber,
       capacity: trip.van.capacity,
-      terminalStatus: 'BOARDING',
       driver: trip.driver,
       trip: {
         id: trip.id,
         routeName: trip.route?.name ?? null,
         origin: trip.route?.origin ?? null,
         destination: trip.route?.destination ?? null,
-        scheduledTime: trip.scheduledTime,
         availableSeats: trip.availableSeats,
         totalSeats: trip.totalSeats,
       },
-    }));
+    });
 
-    return res.status(200).json([...boardingEntries, ...idleEntries]);
+    for (const trip of awaitingCheckIn) {
+      ensureGroup(trip.van.cooperativeId, trip.van.cooperative?.name ?? 'Unassigned').awaitingScan.push(toEntry(trip));
+    }
+    for (const trip of boardingAtTerminal) {
+      ensureGroup(trip.van.cooperativeId, trip.van.cooperative?.name ?? 'Unassigned').boarding.push(toEntry(trip));
+    }
+
+    // queuedAtTerminal is ordered earliest-first overall; rank must be
+    // computed within each cooperative's own line, so re-rank per group.
+    const queuedByGroup = new Map();
+    for (const trip of queuedAtTerminal) {
+      const key = trip.van.cooperativeId ?? 'unassigned';
+      if (!queuedByGroup.has(key)) queuedByGroup.set(key, []);
+      queuedByGroup.get(key).push(trip);
+    }
+    for (const trips of queuedByGroup.values()) {
+      const first = trips[0];
+      const group = ensureGroup(first.van.cooperativeId, first.van.cooperative?.name ?? 'Unassigned');
+      group.queued = trips.map((trip, index) => ({ ...toEntry(trip), queuePosition: index + 1 }));
+    }
+
+    for (const van of idleVans) {
+      ensureGroup(van.cooperativeId, van.cooperative?.name ?? 'Unassigned').idle.push({
+        vanId: van.id,
+        plateNumber: van.plateNumber,
+        capacity: van.capacity,
+        driver: van.driver ?? null,
+      });
+    }
+
+    const result = Array.from(groups.values())
+      .filter((g) => g.awaitingScan.length || g.boarding.length || g.queued.length || g.idle.length)
+      .sort((a, b) => a.cooperativeName.localeCompare(b.cooperativeName));
+
+    return res.status(200).json(result);
   } catch (error) {
     return handleError(res, error, 'getTerminalVans', 'Failed to load vans at the terminal.');
   }
@@ -199,10 +288,6 @@ export const updateDriverLocation = async (req, res) => {
 };
 
 // ─── 0c. Driver: persist seat counts on the trip ─────────────────────────────
-//
-// Called by the driver app whenever the +/- seat controls change. The
-// count lives on the Trip row, so it carries through every phase change
-// and survives logout/login until the trip ends.
 
 export const updateTripSeats = async (req, res) => {
   try {
@@ -242,7 +327,6 @@ export const updateTripSeats = async (req, res) => {
       },
     });
 
-    // Broadcast so the public map and dispatcher see the new count live.
     emitFleetEvent('seat_update_broadcast', {
       tripId: id,
       availableSeats: Math.round(availableSeats),
@@ -259,16 +343,20 @@ export const updateTripSeats = async (req, res) => {
   }
 };
 
-// ─── 1. Update trip status ────────────────────────────────────────────────────
+// ─── 1. Update trip status (driver-initiated, both legs) ─────────────────────
 
 export const updateTripStatus = async (req, res) => {
   try {
     const { id }        = req.params;
     const { newStatus } = req.body;
     const userId        = req.user.id;
+    let promotedTrip     = null;
 
     const updatedTrip = await prisma.$transaction(async (tx) => {
-      const trip = await tx.trip.findUnique({ where: { id } });
+      const trip = await tx.trip.findUnique({
+        where: { id },
+        include: { van: { select: { cooperativeId: true } } },
+      });
       if (!trip) throw new HttpError(404, 'Trip not found.');
 
       const allowed = VALID_TRANSITIONS[trip.status] ?? [];
@@ -276,6 +364,15 @@ export const updateTripStatus = async (req, res) => {
         throw new HttpError(
           400,
           `Invalid transition. Cannot move from ${trip.status} to ${newStatus}.`,
+        );
+      }
+
+      // A trip can only be COMPLETED on its RETURN leg — the OUTBOUND leg's
+      // ARRIVING must go through the dispatcher's QR check-in instead.
+      if (newStatus === 'COMPLETED' && trip.direction !== 'RETURN') {
+        throw new HttpError(
+          400,
+          'This van must be checked in by the dispatcher at the terminal before the trip can continue.',
         );
       }
 
@@ -296,6 +393,13 @@ export const updateTripStatus = async (req, res) => {
         });
       }
 
+      // Leaving the cooperative's BOARDING slot (RETURN leg) frees it up —
+      // advance whichever queued van, from the SAME cooperative, has been
+      // waiting longest.
+      if (trip.status === 'BOARDING' && trip.direction === 'RETURN' && newStatus !== 'BOARDING') {
+        promotedTrip = await promoteNextQueuedTrip(tx, trip.van.cooperativeId);
+      }
+
       return updated;
     });
 
@@ -305,14 +409,18 @@ export const updateTripStatus = async (req, res) => {
       trip:   updatedTrip,
     });
 
-    if (updatedTrip.status === 'BOARDING' || updatedTrip.status === 'DEPARTING') {
-      broadcastStartTracking(updatedTrip);
-    }
-
     if (updatedTrip.status === 'COMPLETED' || updatedTrip.status === 'CANCELLED') {
       clearTripLocation(updatedTrip.id);
       broadcastStopTracking(updatedTrip.id, updatedTrip.driverId);
       emitFleetEvent('trip_removed', { tripId: updatedTrip.id });
+    }
+
+    if (promotedTrip) {
+      emitFleetEvent('trip_status_changed', {
+        tripId: promotedTrip.id,
+        status: promotedTrip.status,
+        trip:   promotedTrip,
+      });
     }
 
     return res.status(200).json({ message: 'Status updated', trip: withVanQrToken(updatedTrip) });
@@ -321,7 +429,13 @@ export const updateTripStatus = async (req, res) => {
   }
 };
 
-// ─── 2. QR scan handler ───────────────────────────────────────────────────────
+// ─── 2. QR scan handler — terminal check-in ONLY ─────────────────────────────
+//
+// The single checkpoint in the round trip needing a dispatcher scan: the
+// moment a van reaches ARRIVING on its OUTBOUND leg. Scanning it checks
+// it into its cooperative's terminal queue — straight to BOARDING if that
+// cooperative's slot is free, otherwise QUEUED behind other vans from the
+// same cooperative (vans from other cooperatives never block each other).
 
 export const handleQrScan = async (req, res) => {
   try {
@@ -334,7 +448,10 @@ export const handleQrScan = async (req, res) => {
     if (!vanId) return res.status(400).json({ error: 'Invalid or unrecognized QR code.' });
 
     const result = await prisma.$transaction(async (tx) => {
-      const van = await tx.van.findUnique({ where: { id: vanId } });
+      const van = await tx.van.findUnique({
+        where: { id: vanId },
+        include: { cooperative: true },
+      });
       if (!van) throw new HttpError(404, 'This QR code refers to a van that no longer exists.');
 
       const trip = await tx.trip.findFirst({
@@ -344,65 +461,91 @@ export const handleQrScan = async (req, res) => {
 
       if (!trip) throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
 
-      if (trip.status === 'BOARDING') {
-        throw new HttpError(
-          400,
-          `${van.plateNumber} is still boarding — the driver needs to mark "I've Departed" first before this scan can advance it.`,
-        );
+      if (trip.direction !== 'OUTBOUND' || trip.status !== 'ARRIVING') {
+        const hint =
+          trip.direction === 'RETURN'
+            ? `${van.plateNumber} is already on its way back — no scan needed for this leg.`
+            : trip.status === 'QUEUED'
+              ? `${van.plateNumber} already checked in and is queued for boarding.`
+              : trip.status === 'BOARDING'
+                ? `${van.plateNumber} is still boarding — ask the driver to mark "Ready to Depart" first.`
+                : `${van.plateNumber} isn't ready to be checked in yet (currently ${trip.status.toLowerCase()}).`;
+        throw new HttpError(400, hint);
       }
 
-      const transition = SCAN_TRANSITIONS[trip.status];
-      if (!transition) {
-        throw new HttpError(400, `${van.plateNumber} is in an unexpected state (${trip.status}) and can't be advanced by scan.`);
-      }
+      const currentlyBoardingAtTerminal = await tx.trip.findFirst({
+        where: { status: 'BOARDING', direction: 'RETURN', van: { cooperativeId: van.cooperativeId } },
+      });
 
-      const updateData = { status: transition.nextStatus };
-      if (transition.setField) updateData[transition.setField] = new Date();
+      const nextStatus = currentlyBoardingAtTerminal ? 'QUEUED' : 'BOARDING';
 
-      const updatedTrip = await tx.trip.update({
+      const updated = await tx.trip.update({
         where: { id: trip.id },
-        data: updateData,
+        data: {
+          status: nextStatus,
+          direction: 'RETURN',
+          actualArrival: trip.actualArrival ?? new Date(),
+        },
         include: TRIP_INCLUDE,
       });
 
       await tx.tripStatusHistory.create({
-        data: { tripId: trip.id, status: transition.nextStatus, recordedById: userId },
+        data: { tripId: trip.id, status: nextStatus, recordedById: userId },
       });
 
       await tx.qrScanLog.create({
-        data: { tripId: trip.id, vanId, scannedById: userId, action: transition.action },
+        data: {
+          tripId: trip.id,
+          vanId,
+          scannedById: userId,
+          action: nextStatus === 'BOARDING' ? 'TERMINAL_CHECK_IN_BOARDING' : 'TERMINAL_CHECK_IN_QUEUED',
+        },
       });
 
-      if (transition.nextStatus === 'COMPLETED') {
-        await tx.van.update({ where: { id: vanId }, data: { status: 'IDLE' } });
+      let queuePosition = null;
+      if (nextStatus === 'QUEUED') {
+        const aheadCount = await tx.trip.count({
+          where: {
+            status: 'QUEUED',
+            direction: 'RETURN',
+            actualArrival: { lt: updated.actualArrival },
+            van: { cooperativeId: van.cooperativeId },
+          },
+        });
+        queuePosition = aheadCount + 1;
       }
 
-      return { trip: updatedTrip, action: transition.action };
+      return {
+        trip: updated,
+        queued: nextStatus === 'QUEUED',
+        queuePosition,
+        cooperativeName: van.cooperative?.name ?? null,
+      };
     });
 
     emitFleetEvent('trip_status_changed', {
       tripId: result.trip.id,
       status: result.trip.status,
-      trip:   result.trip,
+      trip: result.trip,
     });
 
-    if (result.trip.status === 'COMPLETED') {
-      clearTripLocation(result.trip.id);
-      broadcastStopTracking(result.trip.id, result.trip.driverId);
-      emitFleetEvent('trip_removed', { tripId: result.trip.id });
-    }
+    const coopTag = result.cooperativeName ? ` (${result.cooperativeName})` : '';
+    const message = result.queued
+      ? `${result.trip.van?.plateNumber ?? 'Van'}${coopTag} checked in — queued for boarding, position ${result.queuePosition}.`
+      : `${result.trip.van?.plateNumber ?? 'Van'}${coopTag} checked in — now boarding for the return trip.`;
 
     return res.status(200).json({
-      message: `${result.trip.van?.plateNumber ?? 'Van'} → ${result.trip.status}`,
+      message,
       trip: result.trip,
-      action: result.action,
+      queued: result.queued,
+      queuePosition: result.queuePosition,
     });
   } catch (error) {
     return handleError(res, error, 'handleQrScan', 'Failed to process QR scan.');
   }
 };
 
-// ─── 3. Driver's own active trips ─────────────────────────────────────────────
+// ─── 3. Driver's own active trip ──────────────────────────────────────────────
 
 export const getMyTrips = async (req, res) => {
   try {
@@ -420,7 +563,7 @@ export const getMyTrips = async (req, res) => {
   }
 };
 
-// ─── 4. Driver self-starts their own trip ────────────────────────────────────
+// ─── 4. Driver self-starts the outbound leg ──────────────────────────────────
 
 export const selfStartTrip = async (req, res) => {
   try {
@@ -491,9 +634,8 @@ export const selfStartTrip = async (req, res) => {
           vanId: van.id,
           driverId: driverUserId,
           status: 'BOARDING',
+          direction: 'OUTBOUND',
           scheduledTime: new Date(),
-          // Seed from the van so the driver sees a sensible number even
-          // before they touch the seat controls.
           availableSeats: van.capacity,
           totalSeats:     van.capacity,
         },
@@ -522,7 +664,7 @@ export const getDispatchResources = async (req, res) => {
   try {
     const [routes, vans, drivers] = await Promise.all([
       prisma.route.findMany({ orderBy: { name: 'asc' } }),
-      prisma.van.findMany({ where: { status: 'IDLE' } }),
+      prisma.van.findMany({ where: { status: 'IDLE' }, include: { cooperative: true } }),
       prisma.user.findMany({ where: { role: 'DRIVER', isActive: true } }),
     ]);
     return res.status(200).json({ routes, vans, drivers });
@@ -531,7 +673,7 @@ export const getDispatchResources = async (req, res) => {
   }
 };
 
-// ─── 6. Dispatcher: create trip ───────────────────────────────────────────────
+// ─── 6. Dispatcher: create an outbound trip directly ─────────────────────────
 
 export const createTrip = async (req, res) => {
   try {
@@ -570,6 +712,7 @@ export const createTrip = async (req, res) => {
           vanId,
           driverId,
           status: 'BOARDING',
+          direction: 'OUTBOUND',
           scheduledTime: new Date(),
           availableSeats: van?.capacity ?? 14,
           totalSeats:     van?.capacity ?? 14,
