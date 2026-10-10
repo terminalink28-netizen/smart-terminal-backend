@@ -22,11 +22,15 @@ const prisma  = new PrismaClient({ adapter });
 //              QR check-in at the terminal, or via queue promotion)
 //
 // Both legs share the same BOARDING → DEPARTING → DEPARTED → ARRIVING
-// shape, driven by the driver's own buttons. The one exception: ARRIVING
-// while OUTBOUND can only become QUEUED/BOARDING(RETURN) via a dispatcher
-// QR scan (see handleQrScan) — never straight to COMPLETED. ARRIVING
-// while RETURN is finished by the driver's own "Finish Trip" button (a
-// normal call into updateTripStatus), no scan needed.
+// shape. The dispatcher's QR scan guards TWO checkpoints at the terminal:
+//
+//   1. CHECK-IN  — OUTBOUND + ARRIVING  → QUEUED / BOARDING (RETURN leg)
+//   2. EXIT      — RETURN   + DEPARTING → DEPARTED (van leaves the terminal)
+//
+// Everything else is driven by the driver's own buttons. The driver can NOT
+// move a RETURN trip to DEPARTED themselves (that is the exit scan), and
+// cannot COMPLETE an OUTBOUND trip (that is the check-in scan). ARRIVING
+// while RETURN is finished by the driver's own "Finish Trip" button.
 //
 // Terminal boarding is a PER-COOPERATIVE resource: each cooperative has
 // its own single boarding slot, so a van only queues behind other vans
@@ -34,7 +38,7 @@ const prisma  = new PrismaClient({ adapter });
 
 const VALID_TRANSITIONS = {
   BOARDING:   ['DEPARTING', 'DELAYED', 'CANCELLED'],
-  DEPARTING:  ['DEPARTED', 'DELAYED'],
+  DEPARTING:  ['DEPARTED', 'DELAYED'], // DEPARTED on RETURN leg is gated, see below
   DEPARTED:   ['ARRIVING', 'DELAYED'],
   ARRIVING:   ['DELAYED', 'COMPLETED'], // COMPLETED gated by direction, see below
   QUEUED:     [], // only ever changed internally (promotion), never by API caller
@@ -142,7 +146,14 @@ async function promoteNextQueuedTrip(tx, cooperativeId) {
 
 export const getTerminalVans = async (req, res) => {
   try {
-    const [idleVans, awaitingCheckIn, boardingAtTerminal, queuedAtTerminal, cooperatives] = await Promise.all([
+    const [
+      idleVans,
+      awaitingCheckIn,
+      boardingAtTerminal,
+      departingAtTerminal,
+      queuedAtTerminal,
+      cooperatives,
+    ] = await Promise.all([
       prisma.van.findMany({
         where: { status: 'IDLE' },
         include: {
@@ -158,6 +169,13 @@ export const getTerminalVans = async (req, res) => {
       }),
       prisma.trip.findMany({
         where: { status: 'BOARDING', direction: 'RETURN' },
+        include: TRIP_INCLUDE,
+        orderBy: { id: 'desc' },
+      }),
+      // Vans that tapped "Ready to Depart" on the RETURN leg and are
+      // waiting for the dispatcher's exit scan.
+      prisma.trip.findMany({
+        where: { status: 'DEPARTING', direction: 'RETURN' },
         include: TRIP_INCLUDE,
         orderBy: { id: 'desc' },
       }),
@@ -177,6 +195,7 @@ export const getTerminalVans = async (req, res) => {
           cooperativeId: id ?? null,
           cooperativeName: name,
           awaitingScan: [],
+          departing: [],
           boarding: [],
           queued: [],
           idle: [],
@@ -206,6 +225,9 @@ export const getTerminalVans = async (req, res) => {
     for (const trip of awaitingCheckIn) {
       ensureGroup(trip.van.cooperativeId, trip.van.cooperative?.name ?? 'Unassigned').awaitingScan.push(toEntry(trip));
     }
+    for (const trip of departingAtTerminal) {
+      ensureGroup(trip.van.cooperativeId, trip.van.cooperative?.name ?? 'Unassigned').departing.push(toEntry(trip));
+    }
     for (const trip of boardingAtTerminal) {
       ensureGroup(trip.van.cooperativeId, trip.van.cooperative?.name ?? 'Unassigned').boarding.push(toEntry(trip));
     }
@@ -234,7 +256,14 @@ export const getTerminalVans = async (req, res) => {
     }
 
     const result = Array.from(groups.values())
-      .filter((g) => g.awaitingScan.length || g.boarding.length || g.queued.length || g.idle.length)
+      .filter(
+        (g) =>
+          g.awaitingScan.length ||
+          g.departing.length ||
+          g.boarding.length ||
+          g.queued.length ||
+          g.idle.length,
+      )
       .sort((a, b) => a.cooperativeName.localeCompare(b.cooperativeName));
 
     return res.status(200).json(result);
@@ -376,6 +405,15 @@ export const updateTripStatus = async (req, res) => {
         );
       }
 
+      // Leaving the terminal on the RETURN leg must be confirmed by the
+      // dispatcher's QR scan (see handleQrScan), not by the driver.
+      if (newStatus === 'DEPARTED' && trip.direction === 'RETURN') {
+        throw new HttpError(
+          400,
+          'Leaving the terminal must be confirmed by the dispatcher scanning your QR code.',
+        );
+      }
+
       const updated = await tx.trip.update({
         where:   { id },
         data:    { status: newStatus },
@@ -429,13 +467,18 @@ export const updateTripStatus = async (req, res) => {
   }
 };
 
-// ─── 2. QR scan handler — terminal check-in ONLY ─────────────────────────────
+// ─── 2. QR scan handler — the two terminal checkpoints ───────────────────────
 //
-// The single checkpoint in the round trip needing a dispatcher scan: the
-// moment a van reaches ARRIVING on its OUTBOUND leg. Scanning it checks
-// it into its cooperative's terminal queue — straight to BOARDING if that
-// cooperative's slot is free, otherwise QUEUED behind other vans from the
-// same cooperative (vans from other cooperatives never block each other).
+// The dispatcher's scan guards TWO checkpoints at the terminal:
+//
+//   CHECK-IN — a van reaches ARRIVING on its OUTBOUND leg. Scanning it
+//     checks it into its cooperative's terminal queue: straight to BOARDING
+//     if that cooperative's slot is free, otherwise QUEUED behind other vans
+//     from the same cooperative (other cooperatives never block each other).
+//
+//   EXIT — a van on its RETURN leg has tapped "Ready to Depart" (DEPARTING).
+//     Scanning it confirms it physically left the terminal: DEPARTED, and
+//     the actual departure time is recorded.
 
 export const handleQrScan = async (req, res) => {
   try {
@@ -461,15 +504,48 @@ export const handleQrScan = async (req, res) => {
 
       if (!trip) throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
 
+      // ── EXIT scan: RETURN leg, driver is ready to leave the terminal ──
+      if (trip.direction === 'RETURN' && trip.status === 'DEPARTING') {
+        const departed = await tx.trip.update({
+          where: { id: trip.id },
+          data: { status: 'DEPARTED', actualDeparture: new Date() },
+          include: TRIP_INCLUDE,
+        });
+
+        await tx.tripStatusHistory.create({
+          data: { tripId: trip.id, status: 'DEPARTED', recordedById: userId },
+        });
+
+        await tx.qrScanLog.create({
+          data: {
+            tripId: trip.id,
+            vanId,
+            scannedById: userId,
+            action: 'TERMINAL_EXIT_DEPARTED',
+          },
+        });
+
+        return {
+          kind: 'EXIT',
+          trip: departed,
+          queued: false,
+          queuePosition: null,
+          cooperativeName: van.cooperative?.name ?? null,
+        };
+      }
+
+      // ── CHECK-IN scan: OUTBOUND leg, van has reached the terminal ──
       if (trip.direction !== 'OUTBOUND' || trip.status !== 'ARRIVING') {
         const hint =
           trip.direction === 'RETURN'
-            ? `${van.plateNumber} is already on its way back — no scan needed for this leg.`
-            : trip.status === 'QUEUED'
+            ? trip.status === 'QUEUED'
               ? `${van.plateNumber} already checked in and is queued for boarding.`
               : trip.status === 'BOARDING'
-                ? `${van.plateNumber} is still boarding — ask the driver to mark "Ready to Depart" first.`
-                : `${van.plateNumber} isn't ready to be checked in yet (currently ${trip.status.toLowerCase()}).`;
+                ? `${van.plateNumber} is still boarding — ask the driver to tap "Ready to Depart" first.`
+                : `${van.plateNumber} has already left the terminal — no scan needed.`
+            : trip.status === 'BOARDING'
+              ? `${van.plateNumber} is still boarding — ask the driver to mark "Ready to Depart" first.`
+              : `${van.plateNumber} isn't ready to be checked in yet (currently ${trip.status.toLowerCase()}).`;
         throw new HttpError(400, hint);
       }
 
@@ -516,6 +592,7 @@ export const handleQrScan = async (req, res) => {
       }
 
       return {
+        kind: 'CHECK_IN',
         trip: updated,
         queued: nextStatus === 'QUEUED',
         queuePosition,
@@ -529,13 +606,19 @@ export const handleQrScan = async (req, res) => {
       trip: result.trip,
     });
 
+    const plate   = result.trip.van?.plateNumber ?? 'Van';
     const coopTag = result.cooperativeName ? ` (${result.cooperativeName})` : '';
-    const message = result.queued
-      ? `${result.trip.van?.plateNumber ?? 'Van'}${coopTag} checked in — queued for boarding, position ${result.queuePosition}.`
-      : `${result.trip.van?.plateNumber ?? 'Van'}${coopTag} checked in — now boarding for the return trip.`;
+    const dest    = result.trip.route?.origin ?? 'its municipality';
+    const message =
+      result.kind === 'EXIT'
+        ? `${plate}${coopTag} cleared to leave — departed for ${dest}.`
+        : result.queued
+          ? `${plate}${coopTag} checked in — queued for boarding, position ${result.queuePosition}.`
+          : `${plate}${coopTag} checked in — now boarding for the return trip.`;
 
     return res.status(200).json({
       message,
+      kind: result.kind,
       trip: result.trip,
       queued: result.queued,
       queuePosition: result.queuePosition,
