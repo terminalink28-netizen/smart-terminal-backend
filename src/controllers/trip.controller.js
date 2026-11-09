@@ -4,7 +4,7 @@ import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { verifyVanQrToken, signVanQrToken } from '../utils/qr.util.js';
 import {
-  recordLocation,
+  ingestLocation,
   getLiveLocation,
   clearTripLocation,
 } from '../liveLocations.js';
@@ -21,16 +21,21 @@ const prisma  = new PrismaClient({ adapter });
 //   RETURN   — terminal → municipality (entered only via the dispatcher's
 //              QR check-in at the terminal, or via queue promotion)
 //
-// Both legs share the same BOARDING → DEPARTING → DEPARTED → ARRIVING
-// shape. The dispatcher's QR scan guards TWO checkpoints at the terminal:
+// Both legs share the same BOARDING → DEPARTING → DEPARTED shape. There is
+// NO driver-side "approaching" step any more: once a van is DEPARTED on its
+// OUTBOUND leg it is simply "on the way", and the dispatcher's QR scan guards
+// TWO checkpoints at the terminal:
 //
-//   1. CHECK-IN  — OUTBOUND + ARRIVING  → QUEUED / BOARDING (RETURN leg)
+//   1. CHECK-IN  — OUTBOUND + DEPARTED (or legacy ARRIVING) → QUEUED / BOARDING
 //   2. EXIT      — RETURN   + DEPARTING → DEPARTED (van leaves the terminal)
 //
 // Everything else is driven by the driver's own buttons. The driver can NOT
 // move a RETURN trip to DEPARTED themselves (that is the exit scan), and
-// cannot COMPLETE an OUTBOUND trip (that is the check-in scan). ARRIVING
-// while RETURN is finished by the driver's own "Finish Trip" button.
+// cannot COMPLETE an OUTBOUND trip (that is the check-in scan). A RETURN trip
+// that is DEPARTED is finished by the driver's own "Finish Trip" button.
+//
+// A driver may run several trips at the same time, as long as they start from
+// different municipalities (see assertNoDuplicateActiveTrip).
 //
 // Terminal boarding is a PER-COOPERATIVE resource: each cooperative has
 // its own single boarding slot, so a van only queues behind other vans
@@ -39,23 +44,29 @@ const prisma  = new PrismaClient({ adapter });
 const VALID_TRANSITIONS = {
   BOARDING:   ['DEPARTING', 'DELAYED', 'CANCELLED'],
   DEPARTING:  ['DEPARTED', 'DELAYED'], // DEPARTED on RETURN leg is gated, see below
-  DEPARTED:   ['ARRIVING', 'DELAYED'],
-  ARRIVING:   ['DELAYED', 'COMPLETED'], // COMPLETED gated by direction, see below
+  DEPARTED:   ['DELAYED', 'COMPLETED'], // COMPLETED gated by direction, see below
+  ARRIVING:   ['DELAYED', 'COMPLETED'], // legacy only — drivers can no longer move INTO this
   QUEUED:     [], // only ever changed internally (promotion), never by API caller
-  DELAYED:    ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'],
+  DELAYED:    ['BOARDING', 'DEPARTING', 'DEPARTED', 'COMPLETED'],
   COMPLETED:  [],
   CANCELLED:  [],
 };
 
-// Anything that isn't finished yet — used to block a driver from starting
-// a second round trip while one is still in progress.
+// Anything that isn't finished yet.
 const ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'QUEUED', 'DELAYED'];
+
+// Outbound statuses the dispatcher's check-in scan accepts.
+const CHECK_IN_STATUSES = ['DEPARTED', 'ARRIVING'];
 
 const TRIP_INCLUDE = {
   driver: { select: { id: true, name: true, contactNumber: true, contactNumbers: true } },
   route:  true,
   van:    { include: { cooperative: true } },
 };
+
+// GPS ingestion limits
+const MAX_TRIPS_PER_FIX = 10;
+const MAX_BATCH_FIXES   = 50;
 
 // ─── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -113,6 +124,46 @@ function broadcastStopTracking(tripId, driverId) {
   }
 }
 
+// Serialises concurrent start requests for the same driver (double-taps,
+// retries) so the duplicate-trip check below can't be raced.
+async function lockDriver(tx, driverId) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${String(driverId)}))`;
+}
+
+// A driver may run several trips at once, but only ONE per municipality
+// (origin) / route — just like a real driver can't leave the same town twice.
+async function assertNoDuplicateActiveTrip(tx, driverId, route) {
+  const duplicate = await tx.trip.findFirst({
+    where: {
+      driverId,
+      status: { in: ACTIVE_STATUSES },
+      route: {
+        OR: [
+          { id: route.id },
+          { origin: { equals: route.origin, mode: 'insensitive' } },
+        ],
+      },
+    },
+  });
+
+  if (duplicate) {
+    throw new HttpError(
+      400,
+      `You already have an active trip from ${route.origin}. Finish it first, or start one from a different municipality.`,
+    );
+  }
+}
+
+// Sets the van back to IDLE only when it has no other unfinished trips.
+async function releaseVanIfFree(tx, vanId, finishedTripId) {
+  const stillActive = await tx.trip.count({
+    where: { vanId, id: { not: finishedTripId }, status: { in: ACTIVE_STATUSES } },
+  });
+  if (stillActive === 0) {
+    await tx.van.update({ where: { id: vanId }, data: { status: 'IDLE' } });
+  }
+}
+
 // Promotes the longest-waiting QUEUED (RETURN-leg) trip for ONE cooperative
 // into BOARDING once that cooperative's terminal boarding slot frees up.
 // `cooperativeId` may be null — vans with no cooperative assigned share one
@@ -142,7 +193,7 @@ async function promoteNextQueuedTrip(tx, cooperativeId) {
   return promoted;
 }
 
-// ─── 0. Dispatcher: vans currently AT the terminal, grouped by cooperative ───
+// ─── 0. Dispatcher: vans currently AT (or heading to) the terminal ──────────
 
 export const getTerminalVans = async (req, res) => {
   try {
@@ -162,22 +213,24 @@ export const getTerminalVans = async (req, res) => {
         },
         orderBy: { plateNumber: 'asc' },
       }),
+      // Outbound vans that left their municipality and are waiting for the
+      // dispatcher's check-in scan (no driver "approaching" step any more).
       prisma.trip.findMany({
-        where: { status: 'ARRIVING', direction: 'OUTBOUND' },
+        where: { status: { in: CHECK_IN_STATUSES }, direction: 'OUTBOUND' },
         include: TRIP_INCLUDE,
-        orderBy: { id: 'desc' },
+        orderBy: { scheduledTime: 'asc' },
       }),
       prisma.trip.findMany({
         where: { status: 'BOARDING', direction: 'RETURN' },
         include: TRIP_INCLUDE,
-        orderBy: { id: 'desc' },
+        orderBy: { scheduledTime: 'desc' },
       }),
       // Vans that tapped "Ready to Depart" on the RETURN leg and are
       // waiting for the dispatcher's exit scan.
       prisma.trip.findMany({
         where: { status: 'DEPARTING', direction: 'RETURN' },
         include: TRIP_INCLUDE,
-        orderBy: { id: 'desc' },
+        orderBy: { scheduledTime: 'desc' },
       }),
       prisma.trip.findMany({
         where: { status: 'QUEUED', direction: 'RETURN' },
@@ -214,6 +267,7 @@ export const getTerminalVans = async (req, res) => {
       driver: trip.driver,
       trip: {
         id: trip.id,
+        status: trip.status,
         routeName: trip.route?.name ?? null,
         origin: trip.route?.origin ?? null,
         destination: trip.route?.destination ?? null,
@@ -273,44 +327,131 @@ export const getTerminalVans = async (req, res) => {
 };
 
 // ─── 0b. Driver GPS ingestion (HTTP path) ────────────────────────────────────
+//
+// Accepts EITHER a single fix:
+//   { tripId, lat, lng, speed?, accuracy?, heading?, timestamp? }
+// OR a batch of buffered fixes (sent after a signal drop while moving):
+//   { tripId, fixes: [{ lat, lng, speed?, accuracy?, heading?, timestamp }, ...] }
+//
+// `tripIds: [...]` may be used instead of / in addition to `tripId` to apply
+// the same position to several of the driver's active trips at once.
+// `timestamp` is the device's fix time in epoch ms.
+
+function validateFix(f) {
+  if (!f || typeof f.lat !== 'number' || typeof f.lng !== 'number' ||
+      !Number.isFinite(f.lat) || !Number.isFinite(f.lng)) {
+    return 'lat and lng must be numbers.';
+  }
+  if (f.lat < -90 || f.lat > 90 || f.lng < -180 || f.lng > 180) {
+    return 'Coordinates out of range.';
+  }
+  return null;
+}
 
 export const updateDriverLocation = async (req, res) => {
   try {
-    const { tripId, lat, lng, speed, accuracy, heading } = req.body;
+    const { tripId, tripIds, lat, lng, speed, accuracy, heading, timestamp, fixes } = req.body;
     const userId = req.user?.id;
 
     if (!userId) return res.status(401).json({ error: 'Authentication required.' });
-    if (!tripId) return res.status(400).json({ error: 'tripId is required.' });
-    if (typeof lat !== 'number' || typeof lng !== 'number') {
-      return res.status(400).json({ error: 'lat and lng must be numbers.' });
-    }
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      return res.status(400).json({ error: 'Coordinates out of range.' });
+
+    const targetIds = Array.from(
+      new Set(
+        [...(Array.isArray(tripIds) ? tripIds : []), ...(tripId ? [tripId] : [])].filter(
+          (id) => typeof id === 'string' && id.length > 0,
+        ),
+      ),
+    );
+
+    if (targetIds.length === 0) return res.status(400).json({ error: 'tripId is required.' });
+    if (targetIds.length > MAX_TRIPS_PER_FIX) {
+      return res.status(400).json({ error: `Too many trips in one update (max ${MAX_TRIPS_PER_FIX}).` });
     }
 
-    const trip = await prisma.trip.findUnique({
-      where: { id: tripId },
+    // Build the list of fixes to ingest, oldest first.
+    const isBatch = Array.isArray(fixes) && fixes.length > 0;
+    let fixList;
+
+    if (isBatch) {
+      const sliced = fixes.slice(-MAX_BATCH_FIXES);
+      const now = Date.now();
+      const candidates = sliced.map((f, i) => ({
+        lat: f?.lat,
+        lng: f?.lng,
+        speed: f?.speed,
+        accuracy: f?.accuracy,
+        heading: f?.heading,
+        // Missing timestamps: spread them 1s apart ending now so order is kept.
+        timestamp: Number.isFinite(f?.timestamp) ? f.timestamp : now - (sliced.length - 1 - i) * 1000,
+      }));
+      const valid = candidates.filter((f) => !validateFix(f));
+      if (valid.length === 0) {
+        return res.status(400).json({ error: validateFix(candidates[0]) ?? 'No valid fixes supplied.' });
+      }
+      fixList = valid.sort((a, b) => a.timestamp - b.timestamp);
+    } else {
+      const single = { lat, lng, speed, accuracy, heading, timestamp };
+      const err = validateFix(single);
+      if (err) return res.status(400).json({ error: err });
+      fixList = [single];
+    }
+
+    const trips = await prisma.trip.findMany({
+      where: { id: { in: targetIds } },
       select: { id: true, driverId: true, status: true },
     });
 
-    if (!trip) return res.status(404).json({ error: 'Trip not found.' });
-    if (trip.driverId !== userId) {
+    if (trips.length !== targetIds.length) return res.status(404).json({ error: 'Trip not found.' });
+    if (trips.some((t) => t.driverId !== userId)) {
       return res.status(403).json({ error: 'You are not the driver of this trip.' });
     }
-    if (trip.status === 'COMPLETED' || trip.status === 'CANCELLED') {
+
+    const activeTrips = trips.filter((t) => t.status !== 'COMPLETED' && t.status !== 'CANCELLED');
+    if (activeTrips.length === 0) {
       return res.status(400).json({ error: 'Trip is no longer active.' });
     }
 
-    const entry = recordLocation(tripId, { lat, lng, speed, accuracy, heading });
+    const results = [];
+    let firstEntry = null;
 
-    try {
-      const io = getIo();
-      io?.to('map').emit('van_moved', { tripId, ...entry });
-    } catch (err) {
-      console.error('[updateDriverLocation emit]', err);
+    for (const t of activeTrips) {
+      let acceptedEntry = null;
+      let lastReason = null;
+      let currentEntry = null;
+
+      for (const fix of fixList) {
+        const r = ingestLocation(t.id, fix);
+        currentEntry = r.entry ?? currentEntry;
+        if (r.accepted) acceptedEntry = r.entry;
+        else lastReason = r.reason;
+      }
+
+      // Broadcast once per trip — the newest accepted position.
+      if (acceptedEntry) {
+        try {
+          const io = getIo();
+          io?.to('map').emit('van_moved', { tripId: t.id, ...acceptedEntry });
+        } catch (err) {
+          console.error('[updateDriverLocation emit]', err);
+        }
+      }
+
+      results.push({
+        tripId: t.id,
+        accepted: !!acceptedEntry,
+        reason: acceptedEntry ? null : lastReason,
+      });
+
+      if (!firstEntry) firstEntry = currentEntry;
     }
 
-    return res.status(200).json({ ok: true, entry });
+    return res.status(200).json({
+      ok: true,
+      entry: firstEntry,
+      accepted: results.some((r) => r.accepted),
+      results,
+      serverTime: Date.now(),
+    });
   } catch (error) {
     return handleError(res, error, 'updateDriverLocation', 'Failed to record location.');
   }
@@ -388,6 +529,10 @@ export const updateTripStatus = async (req, res) => {
       });
       if (!trip) throw new HttpError(404, 'Trip not found.');
 
+      if (newStatus === 'ARRIVING') {
+        throw new HttpError(400, 'The "arriving" step has been removed. The dispatcher checks vans in at the terminal.');
+      }
+
       const allowed = VALID_TRANSITIONS[trip.status] ?? [];
       if (!allowed.includes(newStatus)) {
         throw new HttpError(
@@ -396,8 +541,8 @@ export const updateTripStatus = async (req, res) => {
         );
       }
 
-      // A trip can only be COMPLETED on its RETURN leg — the OUTBOUND leg's
-      // ARRIVING must go through the dispatcher's QR check-in instead.
+      // A trip can only be COMPLETED on its RETURN leg — the OUTBOUND leg
+      // must go through the dispatcher's QR check-in instead.
       if (newStatus === 'COMPLETED' && trip.direction !== 'RETURN') {
         throw new HttpError(
           400,
@@ -424,11 +569,9 @@ export const updateTripStatus = async (req, res) => {
         data: { tripId: id, status: newStatus, recordedById: userId },
       });
 
+      // The van only becomes IDLE when its LAST active trip is finished.
       if (newStatus === 'COMPLETED' || newStatus === 'CANCELLED') {
-        await tx.van.update({
-          where: { id: trip.vanId },
-          data:  { status: 'IDLE' },
-        });
+        await releaseVanIfFree(tx, trip.vanId, id);
       }
 
       // Leaving the cooperative's BOARDING slot (RETURN leg) frees it up —
@@ -471,18 +614,26 @@ export const updateTripStatus = async (req, res) => {
 //
 // The dispatcher's scan guards TWO checkpoints at the terminal:
 //
-//   CHECK-IN — a van reaches ARRIVING on its OUTBOUND leg. Scanning it
-//     checks it into its cooperative's terminal queue: straight to BOARDING
-//     if that cooperative's slot is free, otherwise QUEUED behind other vans
-//     from the same cooperative (other cooperatives never block each other).
+//   CHECK-IN — a van on its OUTBOUND leg has left its municipality
+//     (DEPARTED, or legacy ARRIVING). Scanning it checks it into its
+//     cooperative's terminal queue: straight to BOARDING if that
+//     cooperative's slot is free, otherwise QUEUED behind other vans from
+//     the same cooperative (other cooperatives never block each other).
 //
 //   EXIT — a van on its RETURN leg has tapped "Ready to Depart" (DEPARTING).
 //     Scanning it confirms it physically left the terminal: DEPARTED, and
 //     the actual departure time is recorded.
+//
+// A van may have several active trips. The scan picks the scannable one
+// automatically (exit scans first, then the oldest outbound trip). The app
+// may send an optional `tripId` to choose a specific trip.
+
+const isExitScannable = (t) => t.direction === 'RETURN' && t.status === 'DEPARTING';
+const isCheckInScannable = (t) => t.direction === 'OUTBOUND' && CHECK_IN_STATUSES.includes(t.status);
 
 export const handleQrScan = async (req, res) => {
   try {
-    const { qrToken } = req.body;
+    const { qrToken, tripId: requestedTripId } = req.body;
     const userId = req.user.id;
 
     if (!qrToken) return res.status(400).json({ error: 'qrToken is required.' });
@@ -497,15 +648,30 @@ export const handleQrScan = async (req, res) => {
       });
       if (!van) throw new HttpError(404, 'This QR code refers to a van that no longer exists.');
 
-      const trip = await tx.trip.findFirst({
+      const activeTrips = await tx.trip.findMany({
         where: { vanId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
-        orderBy: { id: 'desc' },
+        orderBy: { scheduledTime: 'desc' },
       });
 
-      if (!trip) throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
+      if (activeTrips.length === 0) {
+        throw new HttpError(400, `${van.plateNumber} has no active trip right now.`);
+      }
+
+      let trip;
+      if (requestedTripId) {
+        trip = activeTrips.find((t) => t.id === requestedTripId);
+        if (!trip) throw new HttpError(400, `That trip is not active for ${van.plateNumber}.`);
+      } else {
+        trip =
+          activeTrips.find(isExitScannable) ??
+          activeTrips
+            .filter(isCheckInScannable)
+            .sort((a, b) => new Date(a.scheduledTime) - new Date(b.scheduledTime))[0] ??
+          activeTrips[0];
+      }
 
       // ── EXIT scan: RETURN leg, driver is ready to leave the terminal ──
-      if (trip.direction === 'RETURN' && trip.status === 'DEPARTING') {
+      if (isExitScannable(trip)) {
         const departed = await tx.trip.update({
           where: { id: trip.id },
           data: { status: 'DEPARTED', actualDeparture: new Date() },
@@ -535,7 +701,7 @@ export const handleQrScan = async (req, res) => {
       }
 
       // ── CHECK-IN scan: OUTBOUND leg, van has reached the terminal ──
-      if (trip.direction !== 'OUTBOUND' || trip.status !== 'ARRIVING') {
+      if (!isCheckInScannable(trip)) {
         const hint =
           trip.direction === 'RETURN'
             ? trip.status === 'QUEUED'
@@ -545,7 +711,9 @@ export const handleQrScan = async (req, res) => {
                 : `${van.plateNumber} has already left the terminal — no scan needed.`
             : trip.status === 'BOARDING'
               ? `${van.plateNumber} is still boarding — ask the driver to mark "Ready to Depart" first.`
-              : `${van.plateNumber} isn't ready to be checked in yet (currently ${trip.status.toLowerCase()}).`;
+              : trip.status === 'DEPARTING'
+                ? `${van.plateNumber} hasn't left its municipality yet.`
+                : `${van.plateNumber} isn't ready to be checked in yet (currently ${trip.status.toLowerCase()}).`;
         throw new HttpError(400, hint);
       }
 
@@ -628,7 +796,7 @@ export const handleQrScan = async (req, res) => {
   }
 };
 
-// ─── 3. Driver's own active trip ──────────────────────────────────────────────
+// ─── 3. Driver's own active trips ─────────────────────────────────────────────
 
 export const getMyTrips = async (req, res) => {
   try {
@@ -637,7 +805,7 @@ export const getMyTrips = async (req, res) => {
     const trips = await prisma.trip.findMany({
       where: { driverId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       include: TRIP_INCLUDE,
-      orderBy: { id: 'desc' },
+      orderBy: { scheduledTime: 'desc' },
     });
 
     return res.status(200).json(trips.map(withVanQrToken));
@@ -671,29 +839,14 @@ export const selfStartTrip = async (req, res) => {
 
     const van = driverWithVan.assignedVan;
 
-    if (van.status !== 'IDLE') {
+    if (van.status === 'MAINTENANCE') {
       return res.status(400).json({
-        error: `Van ${van.plateNumber} is currently in use. Contact the dispatcher.`,
+        error: `Van ${van.plateNumber} is under maintenance. Contact the dispatcher.`,
       });
     }
 
     const newTrip = await prisma.$transaction(async (tx) => {
-      const existingTrip = await tx.trip.findFirst({
-        where: { driverId: driverUserId, status: { notIn: ['COMPLETED', 'CANCELLED'] } },
-      });
-
-      if (existingTrip) {
-        throw new HttpError(400, 'You already have an active trip. Please complete it first.');
-      }
-
-      const vanClaim = await tx.van.updateMany({
-        where: { id: van.id, status: 'IDLE' },
-        data:  { status: 'ON_TRIP' },
-      });
-
-      if (vanClaim.count === 0) {
-        throw new HttpError(400, `Van ${van.plateNumber} is currently in use. Contact the dispatcher.`);
-      }
+      await lockDriver(tx, driverUserId);
 
       let route = await tx.route.findFirst({ where: { name: routeName } });
 
@@ -710,6 +863,18 @@ export const selfStartTrip = async (req, res) => {
       }
 
       if (!route) throw new HttpError(500, 'Failed to resolve route for this trip.');
+
+      // One active trip per municipality/route — but several at once overall.
+      await assertNoDuplicateActiveTrip(tx, driverUserId, route);
+
+      const vanClaim = await tx.van.updateMany({
+        where: { id: van.id, status: { in: ['IDLE', 'ON_TRIP'] } },
+        data:  { status: 'ON_TRIP' },
+      });
+
+      if (vanClaim.count === 0) {
+        throw new HttpError(400, `Van ${van.plateNumber} is under maintenance. Contact the dispatcher.`);
+      }
 
       return tx.trip.create({
         data: {
@@ -747,7 +912,11 @@ export const getDispatchResources = async (req, res) => {
   try {
     const [routes, vans, drivers] = await Promise.all([
       prisma.route.findMany({ orderBy: { name: 'asc' } }),
-      prisma.van.findMany({ where: { status: 'IDLE' }, include: { cooperative: true } }),
+      // Vans already out on a trip can take another one (different municipality).
+      prisma.van.findMany({
+        where: { status: { in: ['IDLE', 'ON_TRIP'] } },
+        include: { cooperative: true },
+      }),
       prisma.user.findMany({ where: { role: 'DRIVER', isActive: true } }),
     ]);
     return res.status(200).json({ routes, vans, drivers });
@@ -767,27 +936,22 @@ export const createTrip = async (req, res) => {
     }
 
     const trip = await prisma.$transaction(async (tx) => {
-      const vanClaim = await tx.van.updateMany({
-        where: { id: vanId, status: 'IDLE' },
-        data:  { status: 'ON_TRIP' },
-      });
-
-      if (vanClaim.count === 0) {
-        throw new HttpError(400, 'Dispatch failed: this van is already in use.');
-      }
-
-      const driverActiveTrip = await tx.trip.findFirst({
-        where: { driverId, status: { in: ACTIVE_STATUSES } },
-      });
-
-      if (driverActiveTrip) {
-        throw new HttpError(400, 'Dispatch failed: this driver is currently on duty.');
-      }
+      await lockDriver(tx, driverId);
 
       const route = await tx.route.findUnique({ where: { id: routeId } });
       if (!route) throw new HttpError(400, 'Dispatch failed: route not found.');
 
       const van = await tx.van.findUnique({ where: { id: vanId } });
+      if (!van) throw new HttpError(400, 'Dispatch failed: van not found.');
+      if (van.status === 'MAINTENANCE') {
+        throw new HttpError(400, 'Dispatch failed: this van is under maintenance.');
+      }
+
+      // A driver can be on several trips at once, but not twice from the
+      // same municipality/route.
+      await assertNoDuplicateActiveTrip(tx, driverId, route);
+
+      await tx.van.update({ where: { id: vanId }, data: { status: 'ON_TRIP' } });
 
       return tx.trip.create({
         data: {
@@ -797,8 +961,8 @@ export const createTrip = async (req, res) => {
           status: 'BOARDING',
           direction: 'OUTBOUND',
           scheduledTime: new Date(),
-          availableSeats: van?.capacity ?? 14,
-          totalSeats:     van?.capacity ?? 14,
+          availableSeats: van.capacity ?? 14,
+          totalSeats:     van.capacity ?? 14,
         },
         include: TRIP_INCLUDE,
       });
@@ -826,7 +990,7 @@ export const getLiveTrips = async (req, res) => {
     const activeTrips = await prisma.trip.findMany({
       where: { status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       include: TRIP_INCLUDE,
-      orderBy: { id: 'desc' },
+      orderBy: { scheduledTime: 'desc' },
     });
 
     const withLive = activeTrips.map((trip) => ({
