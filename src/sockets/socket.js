@@ -2,7 +2,7 @@
 import { Server } from 'socket.io';
 import {
   getLiveLocationsSnapshot,
-  recordLocation,
+  ingestLocation,
   clearLiveLocations,
 } from '../liveLocations.js';
 
@@ -30,9 +30,6 @@ export function initializeSockets(httpServer) {
     });
 
     // Relays a driver's seat count to everyone watching the public map.
-    // Previously nothing listened for this event at all — the driver's
-    // emit went out into the void, which is why seat counts never updated
-    // on the public tracking page no matter how often the driver tapped +/-.
     socket.on('seat_update', (payload = {}) => {
       const { tripId, availableSeats, totalSeats } = payload;
       if (!tripId || typeof availableSeats !== 'number') return;
@@ -48,12 +45,19 @@ export function initializeSockets(httpServer) {
     });
 
     // Socket-based GPS streaming (alternative to POST /api/trips/location —
-    // the driver app can use either, both funnel into the same store).
+    // both funnel into the same store and the same validation).
+    // The device `timestamp` is passed through so buffered or late fixes keep
+    // their real time, and only ACCEPTED fixes are broadcast — glitch jumps,
+    // out-of-order fixes and poor-accuracy fixes are dropped here.
     socket.on('driver_location', (payload = {}) => {
-      const { tripId, lat, lng, speed, accuracy, heading } = payload;
+      const { tripId, lat, lng, speed, accuracy, heading, timestamp } = payload;
       if (!tripId || typeof lat !== 'number' || typeof lng !== 'number') return;
-      const entry = recordLocation(tripId, { lat, lng, speed, accuracy, heading });
-      if (!entry) return;
+
+      const { entry, accepted } = ingestLocation(tripId, {
+        lat, lng, speed, accuracy, heading, timestamp,
+      });
+      if (!accepted || !entry) return;
+
       io.to('map').emit('van_moved', { tripId, ...entry });
     });
 
